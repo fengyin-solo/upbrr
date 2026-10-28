@@ -509,6 +509,9 @@ func (s *Service) captureDisc(
 	if err != nil {
 		return api.ScreenshotResult{}, err
 	}
+	if err := requireBlurayProtocol(ctx, s.runner, cmd, info); err != nil {
+		return api.ScreenshotResult{}, err
+	}
 	if err := resolveDVDVideoSegmentTimings(ctx, s.runner, cmd, info.Segments, info.DurationSeconds, s.logger); err != nil {
 		return api.ScreenshotResult{}, err
 	}
@@ -538,7 +541,7 @@ func (s *Service) captureDisc(
 				continue
 			}
 			frameSourcePath, frameTimestamp := resolveSegmentTimestamp(info, ts)
-			infoResult, infoErr := getFrameInfo(ctx, s.runner, cmd, frameSourcePath, frameTimestamp)
+			infoResult, infoErr := getFrameInfo(ctx, s.runner, cmd, frameSourcePath, frameTimestamp, info.Playlist)
 			if infoErr != nil {
 				s.logger.Debugf("screenshots: frame info failed: %v", infoErr)
 				continue
@@ -635,6 +638,7 @@ func (s *Service) captureDisc(
 					output,
 				)
 				capture := captureRequest{
+					Playlist:      info.Playlist,
 					InputPath:     candidate.SourcePath,
 					OutputPath:    output,
 					Timestamp:     candidate.Timestamp,
@@ -838,6 +842,9 @@ func (s *Service) previewDisc(
 	if err != nil {
 		return api.ScreenshotPreview{}, err
 	}
+	if err := requireBlurayProtocol(ctx, s.runner, cmd, info); err != nil {
+		return api.ScreenshotPreview{}, err
+	}
 	if err := resolveDVDVideoSegmentTimings(ctx, s.runner, cmd, info.Segments, info.DurationSeconds, s.logger); err != nil {
 		return api.ScreenshotPreview{}, err
 	}
@@ -863,6 +870,7 @@ func (s *Service) previewDisc(
 			candidate.SourcePath,
 		)
 		payload, err = captureFrameBytes(ctx, s.runner, cmd, previewRequest{
+			Playlist:  info.Playlist,
 			InputPath: candidate.SourcePath,
 			Timestamp: candidate.Timestamp,
 			ToneMap:   shouldTonemap(meta, s.cfg),
@@ -1322,6 +1330,8 @@ func screenshotDiscs(meta api.ScreenshotSubject) []api.ScreenshotDiscSubject {
 		return append([]api.ScreenshotDiscSubject(nil), meta.Discs...)
 	}
 	return []api.ScreenshotDiscSubject{{
+		BluRayISO:             meta.BluRayISO,
+		BDInfoSummary:         meta.BDInfoSummary,
 		ID:                    strings.TrimSpace(meta.DiscID),
 		Name:                  strings.TrimSpace(meta.DiscName),
 		Type:                  strings.TrimSpace(meta.DiscType),
@@ -1333,6 +1343,8 @@ func screenshotDiscs(meta api.ScreenshotSubject) []api.ScreenshotDiscSubject {
 }
 
 func screenshotSubjectForDisc(meta api.ScreenshotSubject, disc api.ScreenshotDiscSubject) api.ScreenshotSubject {
+	meta.BluRayISO = disc.BluRayISO
+	meta.BDInfoSummary = disc.BDInfoSummary
 	meta.DiscID = strings.TrimSpace(disc.ID)
 	meta.DiscName = strings.TrimSpace(disc.Name)
 	meta.DiscRoot = strings.TrimSpace(disc.Root)

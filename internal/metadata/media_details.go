@@ -185,6 +185,15 @@ func (s *Service) deriveMediaFacts(ctx context.Context, meta preparationstate.St
 	logger.Tracef("metadata: media details audio=%q channels=%q commentary=%t", meta.Audio, meta.Channels, meta.HasCommentary)
 
 	meta.Is3D = threeDFromMedia(miDoc, bdinfo)
+	blurayISO := false
+	for _, disc := range meta.Discs {
+		if disc.BluRayISO {
+			blurayISO = true
+			// ISO collection has already validated MVC in every selected report.
+			meta.Is3D = "3D"
+			break
+		}
+	}
 	logger.Tracef("metadata: media details 3d=%q", meta.Is3D)
 
 	source, typeValue := sourceAndType(meta, miDoc)
@@ -213,11 +222,12 @@ func (s *Service) deriveMediaFacts(ctx context.Context, meta preparationstate.St
 			return preparationstate.State{}, fmt.Errorf("metadata: persist dvd mediainfo details: %w", err)
 		}
 	}
-	// For non-DVD content, if rls did not parse a resolution from the filename,
-	// fall back to deriving it from the MediaInfo video track dimensions —
-	// matching the Python get_resolution() behaviour.
+	// ISO preparation uses the selected BDInfo report instead of MediaInfo.
+	// Preserve parsed values here; explicit naming corrections are applied later.
 	if strings.TrimSpace(meta.Release.Resolution) == "" && !strings.EqualFold(meta.DiscType, "DVD") {
-		if res := resolutionFromMediaInfo(miDoc, meta.SourcePath); res != "" {
+		if blurayISO && bdinfo != nil && len(bdinfo.Video) > 0 {
+			meta.Release.Resolution = strings.TrimSpace(bdinfo.Video[0].Resolution)
+		} else if res := resolutionFromMediaInfo(miDoc, meta.SourcePath); res != "" {
 			meta.Release.Resolution = res
 			logger.Debugf("metadata: resolution derived from mediainfo %q", res)
 		}
