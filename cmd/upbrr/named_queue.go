@@ -133,7 +133,9 @@ func openCLINamedQueueWithSync(
 		}
 	}
 	if created || refresh {
-		paths, err := filesystem.GatherQueuePaths(ctx, root)
+		paths, err := filesystem.GatherQueuePathsWithOptions(ctx, root, filesystem.QueueOptions{
+			IgnoreFile: filesystem.QueueIgnoreFileName,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("discover queue members: %w", err)
 		}

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/autobrr/upbrr/internal/config"
+	"github.com/autobrr/upbrr/internal/filesystem"
 	"github.com/autobrr/upbrr/internal/releaseworkflow"
 	"github.com/autobrr/upbrr/pkg/api"
 )
@@ -923,4 +924,36 @@ func TestNamedQueueRetainsConfirmedUploadsWhenCompositeFails(t *testing.T) {
 			t.Fatalf("partial failure lost confirmed submission: %+v", item)
 		}
 	})
+}
+
+func TestNamedQueueDiscoveryHonorsIgnoreFile(t *testing.T) {
+	dbPath, root, paths := queueFixture(t)
+	ignorePath := filepath.Join(root, filesystem.QueueIgnoreFileName)
+	writeIgnore := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(ignorePath, []byte(content), 0o600); err != nil {
+			t.Fatalf("write queue ignore: %v", err)
+		}
+	}
+	writeIgnore("# hold b for manual inspection\nb.mkv\n")
+
+	queue, err := openCLINamedQueue(t.Context(), dbPath, "ignored", root, false, io.Discard)
+	if err != nil {
+		t.Fatalf("open queue with ignore file: %v", err)
+	}
+	want := []string{paths[0], paths[2], paths[3]}
+	if got := queue.paths(false, 0); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ignore file did not exclude a member on queue creation: %v", got)
+	}
+	if err := queue.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// An unsafe entry fails refresh loudly with its line number rather than
+	// silently falling back to a full scan.
+	writeIgnore("../outside-queue\n")
+	_, err = openCLINamedQueue(t.Context(), dbPath, "ignored", root, true, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "discover queue members") || !strings.Contains(err.Error(), "line 1") {
+		t.Fatalf("expected line-numbered discovery error, got %v", err)
+	}
 }
