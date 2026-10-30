@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/autobrr/upbrr/internal/logging"
+
 	internalerrors "github.com/autobrr/upbrr/internal/errors"
 	"github.com/autobrr/upbrr/internal/filesystem"
 	"github.com/autobrr/upbrr/internal/metadata/discparse"
@@ -19,25 +21,46 @@ import (
 )
 
 // resolveBDMVPlaylistSelection resolves one complete selection against every
-// discovered BDMV and persists it only after all discs validate.
+// discovered BDMV and persists it only after all discs validate. Unreadable
+// individual MPLS files are isolated into diagnostics; selection is blocked
+// only when a disc offers no usable candidate at all.
 func (s *Service) resolveBDMVPlaylistSelection(ctx context.Context, request preparationstate.Request) ([]api.PlaylistInfo, error) {
 	discs := request.Layout.Discs
 	if len(discs) == 0 {
 		return nil, fmt.Errorf("metadata: BDMV resources are unavailable: %w", internalerrors.ErrInvalidInput)
 	}
+	logger := logging.FromContext(ctx, s.logger)
 	candidates := make([]api.PlaylistInfo, 0)
+	issues := make([]api.PlaylistIssue, 0)
 	for _, disc := range discs {
 		if disc.Type != "BDMV" {
 			return nil, fmt.Errorf("metadata: invalid BDMV resource set: %w", internalerrors.ErrInvalidInput)
 		}
-		discovered, err := discoverBDMVPlaylists(ctx, disc.Root)
+		report, err := discoverBDMVPlaylists(ctx, disc.Root)
 		if err != nil {
 			return nil, fmt.Errorf("metadata: discover BDMV playlists: %w", err)
 		}
-		if len(discovered) == 0 {
+		for _, issue := range report.Issues {
+			apiIssue := apiPlaylistIssueForDisc(issue, disc)
+			issues = append(issues, apiIssue)
+			logger.Warnf(
+				"metadata: unreadable BDMV playlist disc=%s file=%s stage=%s reason=%s",
+				disc.Name,
+				apiIssue.File,
+				apiIssue.Stage,
+				apiIssue.Reason,
+			)
+		}
+		if len(report.Playlists) == 0 {
+			if len(report.Issues) > 0 {
+				return nil, &api.PlaylistDiscoveryError{
+					SourcePath: request.Layout.SourcePath,
+					Issues:     append([]api.PlaylistIssue(nil), issues...),
+				}
+			}
 			return nil, fmt.Errorf("metadata: BDMV disc has no discoverable playlists: %w", internalerrors.ErrInvalidInput)
 		}
-		for _, playlist := range discovered {
+		for _, playlist := range report.Playlists {
 			candidates = append(candidates, apiPlaylistForDisc(playlist, disc, len(discs) == 1))
 		}
 	}
@@ -49,20 +72,20 @@ func (s *Service) resolveBDMVPlaylistSelection(ctx context.Context, request prep
 		stored, err := s.repo.GetPlaylistSelection(ctx, playlistSelectionKey(request.Layout.SourcePath))
 		if err != nil {
 			if errors.Is(err, internalerrors.ErrNotFound) {
-				return nil, playlistSelectionRequired(request, candidates)
+				return nil, playlistSelectionRequired(request, candidates, issues)
 			}
 			return nil, fmt.Errorf("metadata: load remembered playlist selection: %w", err)
 		}
 		storedFingerprint := strings.TrimSpace(stored.SourceFingerprint)
 		currentFingerprint := strings.TrimSpace(request.SourceFingerprint)
 		if storedFingerprint != currentFingerprint && (storedFingerprint != "" || len(discs) != 1) {
-			return nil, playlistSelectionRequired(request, candidates)
+			return nil, playlistSelectionRequired(request, candidates, issues)
 		}
 		selected = append([]string(nil), stored.SelectedPlaylists...)
 		useAll = stored.UseAll
 	}
 
-	resolved, err := resolvePlaylistIDs(request, candidates, selected, useAll)
+	resolved, err := resolvePlaylistIDs(request, candidates, issues, selected, useAll)
 	if err != nil {
 		return nil, err
 	}
@@ -85,6 +108,7 @@ func (s *Service) resolveBDMVPlaylistSelection(ctx context.Context, request prep
 func resolvePlaylistIDs(
 	request preparationstate.Request,
 	candidates []api.PlaylistInfo,
+	issues []api.PlaylistIssue,
 	selected []string,
 	useAll bool,
 ) ([]api.PlaylistInfo, error) {
@@ -92,7 +116,7 @@ func resolvePlaylistIDs(
 		return append([]api.PlaylistInfo(nil), candidates...), nil
 	}
 	if len(selected) == 0 {
-		return nil, playlistSelectionRequired(request, candidates)
+		return nil, playlistSelectionRequired(request, candidates, issues)
 	}
 
 	byID := make(map[string]api.PlaylistInfo, len(candidates))
@@ -179,10 +203,11 @@ func validateLegacyPlaylistName(value string) (string, error) {
 	return normalized, nil
 }
 
-func playlistSelectionRequired(request preparationstate.Request, candidates []api.PlaylistInfo) error {
+func playlistSelectionRequired(request preparationstate.Request, candidates []api.PlaylistInfo, issues []api.PlaylistIssue) error {
 	return &api.PlaylistSelectionRequiredError{
 		SourcePath: request.Layout.SourcePath,
 		Candidates: append([]api.PlaylistInfo(nil), candidates...),
+		Issues:     append([]api.PlaylistIssue(nil), issues...),
 	}
 }
 
@@ -210,5 +235,18 @@ func apiPlaylistForDisc(value filesystem.PlaylistInfo, disc sourcelayout.DiscRes
 		Items:    items,
 		Score:    value.Score,
 		Edition:  value.Edition,
+	}
+}
+
+// apiPlaylistIssueForDisc scopes one filesystem-level playlist issue to its
+// owning disc. The on-disk basename is preserved verbatim so the corrupt
+// entry can be located exactly.
+func apiPlaylistIssueForDisc(value filesystem.PlaylistIssue, disc sourcelayout.DiscResource) api.PlaylistIssue {
+	return api.PlaylistIssue{
+		DiscID:   disc.ID,
+		DiscName: disc.Name,
+		File:     value.File,
+		Stage:    string(value.Stage),
+		Reason:   value.Reason,
 	}
 }

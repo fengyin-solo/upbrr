@@ -6,6 +6,7 @@ package filesystem
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -35,28 +36,45 @@ type PlaylistItem struct {
 	Size int64
 }
 
+// PlaylistFailureStage locates where parsing one MPLS file failed.
+type PlaylistFailureStage string
+
+const (
+	// PlaylistFailureOpen means the MPLS file itself could not be opened.
+	PlaylistFailureOpen PlaylistFailureStage = "open"
+	// PlaylistFailureHeader means the MPLS header could not be read or validated.
+	PlaylistFailureHeader PlaylistFailureStage = "header"
+	// PlaylistFailurePlayItems means the playlist play items could not be read.
+	PlaylistFailurePlayItems PlaylistFailureStage = "play_items"
+	// PlaylistFailureStreamFiles means referenced stream files could not be associated.
+	PlaylistFailureStreamFiles PlaylistFailureStage = "stream_files"
+)
+
+// PlaylistIssue describes one MPLS file that could not be parsed. File is the
+// playlist basename, Stage locates the failure, and Reason is a readable
+// explanation that never contains absolute filesystem paths.
+type PlaylistIssue struct {
+	File   string
+	Stage  PlaylistFailureStage
+	Reason string
+}
+
+// PlaylistReport is the diagnostic playlist listing returned by ListPlaylists:
+// valid score-ranked Playlists plus filename-sorted Issues for MPLS files that
+// could not be parsed.
+type PlaylistReport struct {
+	Playlists []PlaylistInfo
+	Issues    []PlaylistIssue
+}
+
 // DiscoverPlaylists discovers and scores all MPLS files in a BDMV folder. It
-// returns candidates ordered by descending score.
+// returns candidates ordered by descending score. The first unreadable MPLS
+// aborts discovery; callers that need per-file isolation and diagnostics
+// should use ListPlaylists instead.
 func DiscoverPlaylists(ctx context.Context, bdmvRoot string) ([]PlaylistInfo, error) {
-	if bdmvRoot == "" {
-		return nil, fmt.Errorf("playlist: empty path: %w", internalerrors.ErrInvalidInput)
-	}
-
-	playlistDir := filepath.Join(bdmvRoot, "PLAYLIST")
-	info, err := os.Stat(playlistDir)
+	playlistDir, entries, err := resolvePlaylistDirectory(bdmvRoot)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("playlist: directory %q not found: %w", playlistDir, internalerrors.ErrNotFound)
-		}
-		return nil, fmt.Errorf("playlist: stat %q: %w", playlistDir, err)
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("playlist: %q is not a directory: %w", playlistDir, internalerrors.ErrInvalidInput)
-	}
-
-	entries, err := os.ReadDir(playlistDir)
-	if err != nil {
-		return nil, fmt.Errorf("playlist: read directory %q: %w", playlistDir, err)
+		return nil, err
 	}
 
 	var playlists []PlaylistInfo
@@ -103,6 +121,102 @@ func DiscoverPlaylists(ctx context.Context, bdmvRoot string) ([]PlaylistInfo, er
 	})
 
 	return playlists, nil
+}
+
+// ListPlaylists discovers and scores every readable MPLS file in a BDMV
+// folder, isolating per-file parse failures instead of aborting the whole
+// directory. It returns valid playlists ordered by descending score (filename
+// order preserved for ties) and unreadable files ordered by filename. When
+// every MPLS file is unreadable the report carries no playlists but complete
+// diagnostics and a nil error; a missing PLAYLIST directory or one without
+// MPLS files still returns an ErrNotFound error.
+func ListPlaylists(ctx context.Context, bdmvRoot string) (PlaylistReport, error) {
+	if err := ctx.Err(); err != nil {
+		return PlaylistReport{}, fmt.Errorf("context canceled: %w", err)
+	}
+
+	playlistDir, entries, err := resolvePlaylistDirectory(bdmvRoot)
+	if err != nil {
+		return PlaylistReport{}, err
+	}
+
+	report := PlaylistReport{}
+	for _, entry := range entries {
+		select {
+		case <-ctx.Done():
+			return PlaylistReport{}, fmt.Errorf("context canceled: %w", ctx.Err())
+		default:
+		}
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.EqualFold(filepath.Ext(name), ".MPLS") {
+			continue
+		}
+
+		duration, items, stageErr := parseMPLSStaged(filepath.Join(playlistDir, name))
+		if stageErr != nil {
+			report.Issues = append(report.Issues, PlaylistIssue{
+				File:   name,
+				Stage:  stageErr.stage,
+				Reason: stageErr.reason,
+			})
+			continue
+		}
+
+		// Calculate playlist score using the same weighted algorithm as discovery.
+		score := calculatePlaylistScore(duration, items)
+
+		report.Playlists = append(report.Playlists, PlaylistInfo{
+			File:     name,
+			Duration: duration,
+			Items:    items,
+			Score:    score,
+			Edition:  "",
+		})
+	}
+
+	if len(report.Playlists) == 0 && len(report.Issues) == 0 {
+		return PlaylistReport{}, fmt.Errorf("playlist: no MPLS files found in %q: %w", playlistDir, internalerrors.ErrNotFound)
+	}
+
+	// Stable score ordering keeps equal-score playlists in filename order.
+	sort.SliceStable(report.Playlists, func(i, j int) bool {
+		return report.Playlists[i].Score > report.Playlists[j].Score
+	})
+	sort.SliceStable(report.Issues, func(i, j int) bool {
+		return report.Issues[i].File < report.Issues[j].File
+	})
+
+	return report, nil
+}
+
+// resolvePlaylistDirectory validates bdmvRoot and returns its PLAYLIST
+// directory together with the sorted directory entries.
+func resolvePlaylistDirectory(bdmvRoot string) (string, []os.DirEntry, error) {
+	if bdmvRoot == "" {
+		return "", nil, fmt.Errorf("playlist: empty path: %w", internalerrors.ErrInvalidInput)
+	}
+
+	playlistDir := filepath.Join(bdmvRoot, "PLAYLIST")
+	info, err := os.Stat(playlistDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil, fmt.Errorf("playlist: directory %q not found: %w", playlistDir, internalerrors.ErrNotFound)
+		}
+		return "", nil, fmt.Errorf("playlist: stat %q: %w", playlistDir, err)
+	}
+	if !info.IsDir() {
+		return "", nil, fmt.Errorf("playlist: %q is not a directory: %w", playlistDir, internalerrors.ErrInvalidInput)
+	}
+
+	entries, err := os.ReadDir(playlistDir)
+	if err != nil {
+		return "", nil, fmt.Errorf("playlist: read directory %q: %w", playlistDir, err)
+	}
+	return playlistDir, entries, nil
 }
 
 // calculatePlaylistScore computes a weighted score for playlist ranking.
@@ -152,27 +266,77 @@ func calculatePlaylistScore(duration float64, items []PlaylistItem) float64 {
 // ParseMPLS returns an MPLS playlist's duration in seconds and referenced M2TS
 // basenames with stream sizes in bytes.
 func ParseMPLS(mpslPath string) (float64, []PlaylistItem, error) {
+	duration, items, stageErr := parseMPLSStaged(mpslPath)
+	if stageErr != nil {
+		return 0, nil, stageErr.err
+	}
+	return duration, items, nil
+}
+
+// playlistStageError pairs a parse failure with its diagnostic stage and a
+// path-free readable reason while preserving the legacy wrapped message used
+// by ParseMPLS.
+type playlistStageError struct {
+	stage  PlaylistFailureStage
+	reason string
+	err    error
+}
+
+func (e *playlistStageError) Error() string {
+	return e.err.Error()
+}
+
+func (e *playlistStageError) Unwrap() error {
+	return e.err
+}
+
+func newPlaylistStageError(stage PlaylistFailureStage, reason string, err error) *playlistStageError {
+	return &playlistStageError{
+		stage:  stage,
+		reason: reason,
+		err:    err,
+	}
+}
+
+// parseMPLSStaged parses one MPLS file, tagging every failure with the stage
+// it occurred in. The wrapped error text stays compatible with ParseMPLS.
+func parseMPLSStaged(mpslPath string) (float64, []PlaylistItem, *playlistStageError) {
 	file, err := os.Open(mpslPath)
 	if err != nil {
-		return 0, nil, fmt.Errorf("open MPLS playlist: %w", err)
+		return 0, nil, newPlaylistStageError(
+			PlaylistFailureOpen,
+			"cannot open playlist file: "+pathFreePlaylistCause(err),
+			fmt.Errorf("open MPLS playlist: %w", err),
+		)
 	}
 	defer file.Close()
 
 	// Validate MPLS signature and get header.
 	header, err := loadMoviePlaylist(file)
 	if err != nil {
-		return 0, nil, fmt.Errorf("failed to load movie playlist header: %w", err)
+		return 0, nil, newPlaylistStageError(
+			PlaylistFailureHeader,
+			playlistHeaderFailureReason(err),
+			fmt.Errorf("failed to load movie playlist header: %w", err),
+		)
 	}
 
 	// Seek to playlist start and load the playlist structure.
-	_, err = file.Seek(int64(header.PlaylistStartAddress), io.SeekStart)
-	if err != nil {
-		return 0, nil, fmt.Errorf("failed to seek to playlist: %w", err)
+	if _, err := file.Seek(int64(header.PlaylistStartAddress), io.SeekStart); err != nil {
+		return 0, nil, newPlaylistStageError(
+			PlaylistFailurePlayItems,
+			"cannot read playlist play items: "+pathFreePlaylistCause(err),
+			fmt.Errorf("failed to seek to playlist: %w", err),
+		)
 	}
 
 	_, playlistItems, err := loadPlaylist(file)
 	if err != nil {
-		return 0, nil, fmt.Errorf("failed to load playlist: %w", err)
+		return 0, nil, newPlaylistStageError(
+			PlaylistFailurePlayItems,
+			"cannot read playlist play items: "+pathFreePlaylistCause(err),
+			fmt.Errorf("failed to load playlist: %w", err),
+		)
 	}
 
 	// Calculate total duration from play items (intime/outtime at 45kHz).
@@ -195,10 +359,42 @@ func ParseMPLS(mpslPath string) (float64, []PlaylistItem, error) {
 	// Get file sizes from STREAM directory.
 	itemsWithSizes, err := attachStreamSizes(filepath.Dir(mpslPath), clipNames)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, newPlaylistStageError(
+			PlaylistFailureStreamFiles,
+			"cannot associate referenced stream files: "+pathFreePlaylistCause(err),
+			err,
+		)
 	}
 
 	return totalDuration, itemsWithSizes, nil
+}
+
+// playlistHeaderFailureReason renders header failures without raw signature
+// bytes (which may be non-printable) or absolute paths.
+func playlistHeaderFailureReason(err error) string {
+	if strings.Contains(err.Error(), "invalid MPLS signature") {
+		return "invalid MPLS signature"
+	}
+	return "cannot read MPLS header: " + pathFreePlaylistCause(err)
+}
+
+// pathFreePlaylistCause renders an MPLS parse cause as a stable readable
+// string without absolute filesystem paths.
+func pathFreePlaylistCause(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected end of file"
+	}
+	if pathErr, ok := errors.AsType[*os.PathError](err); ok {
+		return pathErr.Err.Error()
+	}
+	if linkErr, ok := errors.AsType[*os.LinkError](err); ok {
+		return linkErr.Err.Error()
+	}
+	return strings.TrimSpace(err.Error())
 }
 
 // MoviePlaylistHeader represents the MPLS file header.

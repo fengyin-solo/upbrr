@@ -3,7 +3,10 @@
 
 package api
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // BDMVRescanRequiredError reports a partial cached Blu-ray analysis that needs
 // caller confirmation before rescanning the selected playlists.
@@ -36,11 +39,31 @@ type PlaylistSelectionRequiredError struct {
 	SourcePath string
 	// Candidates contains the discovered playlists available for selection.
 	Candidates []PlaylistInfo
+	// Issues lists unreadable playlist files that were isolated while the
+	// reported candidates remained selectable.
+	Issues []PlaylistIssue
 }
 
 // Error returns the stable playlist-selection-required message.
 func (*PlaylistSelectionRequiredError) Error() string {
 	return "Blu-ray playlist selection is required"
+}
+
+// PlaylistDiscoveryError reports a BDMV source whose MPLS files could not be
+// parsed, leaving no selectable playlist candidate.
+type PlaylistDiscoveryError struct {
+	// SourcePath identifies the requested local Blu-ray source.
+	SourcePath string
+	// Issues describes every unreadable playlist file, never with paths.
+	Issues []PlaylistIssue
+}
+
+// Error returns a stable path-free message summarizing the failed discovery.
+func (e *PlaylistDiscoveryError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return "no readable Blu-ray playlists found: " + fmt.Sprintf("%d playlist file(s) could not be parsed", len(e.Issues))
 }
 
 // InvalidPlaylistSelectionError reports a selected playlist that cannot be

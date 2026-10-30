@@ -87,6 +87,21 @@ func TestClassifyOperationErrorCanonicalMappings(t *testing.T) {
 			recovery:  api.OperationRecoveryEditInput,
 		},
 		{
+			name:      "playlist unreadable",
+			operation: api.OperationKindPreparation,
+			cause: &api.PlaylistDiscoveryError{
+				SourcePath: `C:\private`,
+				Issues: []api.PlaylistIssue{{
+					File:   "00001.MPLS",
+					Stage:  api.PlaylistIssueStageHeader,
+					Reason: "invalid MPLS signature",
+				}},
+			},
+			wantCode: api.OperationFailureInvalidInput,
+			message:  "No readable Blu-ray playlists were found in the selected source.",
+			recovery: api.OperationRecoveryEditInput,
+		},
+		{
 			name:      "rescan confirmation",
 			operation: api.OperationKindPreparation,
 			cause:     &api.BDMVRescanRequiredError{SourcePath: `C:\private`},

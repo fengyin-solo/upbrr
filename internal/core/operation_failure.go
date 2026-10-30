@@ -75,6 +75,7 @@ func classifyOperationError(operation api.OperationKind, err error) error {
 	var missing *api.MissingRequirementError
 	var rescan *api.BDMVRescanRequiredError
 	var playlistRequired *api.PlaylistSelectionRequiredError
+	var playlistDiscovery *api.PlaylistDiscoveryError
 	var invalidPlaylist *api.InvalidPlaylistSelectionError
 	var authRequired *trackerauth.AuthRequiredError
 	var needs2FA *trackerauth.Needs2FAError
@@ -107,6 +108,10 @@ func classifyOperationError(operation api.OperationKind, err error) error {
 		failure.Code = api.OperationFailureMissingPrerequisite
 		failure.Message = "Select at least one Blu-ray playlist before preparing the release."
 		failure.Recovery = api.OperationRecoveryCompletePrerequisite
+	case errors.As(err, &playlistDiscovery):
+		failure.Code = api.OperationFailureInvalidInput
+		failure.Message = "No readable Blu-ray playlists were found in the selected source."
+		failure.Recovery = api.OperationRecoveryEditInput
 	case errors.As(err, &invalidPlaylist):
 		failure.Code = api.OperationFailureInvalidInput
 		failure.Message = "The Blu-ray playlist selection is invalid."

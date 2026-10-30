@@ -678,11 +678,11 @@ func TestPrepareBDMVMultiPlaylistUsesFullScanAndDerivesSummaries(t *testing.T) {
 		parseBDInfoOutput = originalParseOutput
 	})
 
-	discoverBDMVPlaylists = func(_ context.Context, _ string) ([]filesystem.PlaylistInfo, error) {
-		return []filesystem.PlaylistInfo{
+	discoverBDMVPlaylists = func(_ context.Context, _ string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{Playlists: []filesystem.PlaylistInfo{
 			{File: "00001.MPLS", Duration: 5400},
 			{File: "00002.MPLS", Duration: 6000},
-		}, nil
+		}}, nil
 	}
 	parseBDMVPlaylist = func(mplsPath string) (float64, []filesystem.PlaylistItem, error) {
 		switch filepath.Base(strings.ToUpper(mplsPath)) {
@@ -817,10 +817,10 @@ func TestResolveBDMVPlaylistSelectionRejectsUnknownDirectPlaylist(t *testing.T) 
 		discoverBDMVPlaylists = originalDiscover
 	})
 
-	discoverBDMVPlaylists = func(_ context.Context, _ string) ([]filesystem.PlaylistInfo, error) {
-		return []filesystem.PlaylistInfo{
+	discoverBDMVPlaylists = func(_ context.Context, _ string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{Playlists: []filesystem.PlaylistInfo{
 			{File: "00001.MPLS", Duration: 5400},
-		}, nil
+		}}, nil
 	}
 
 	_, err := (&Service{}).resolveBDMVPlaylistSelection(context.Background(), preparationstate.Request{
@@ -851,13 +851,13 @@ func TestResolveBDMVPlaylistSelectionRequiredIncludesCandidates(t *testing.T) {
 		discoverBDMVPlaylists = originalDiscover
 	})
 
-	discoverBDMVPlaylists = func(_ context.Context, _ string) ([]filesystem.PlaylistInfo, error) {
-		return []filesystem.PlaylistInfo{{
+	discoverBDMVPlaylists = func(_ context.Context, _ string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{Playlists: []filesystem.PlaylistInfo{{
 			File:     "00001.MPLS",
 			Duration: 5400,
 			Items:    []filesystem.PlaylistItem{{File: "00001.m2ts", Size: 100}},
 			Score:    75,
-		}}, nil
+		}}}, nil
 	}
 
 	_, err := (&Service{repo: &fakeRepo{}}).resolveBDMVPlaylistSelection(context.Background(), preparationstate.Request{
@@ -882,7 +882,9 @@ func TestResolveBDMVPlaylistSelectionRequiredIncludesCandidates(t *testing.T) {
 func TestResolveBDMVPlaylistSelectionRejectsDiscWithoutPlaylists(t *testing.T) {
 	originalDiscover := discoverBDMVPlaylists
 	t.Cleanup(func() { discoverBDMVPlaylists = originalDiscover })
-	discoverBDMVPlaylists = func(context.Context, string) ([]filesystem.PlaylistInfo, error) { return nil, nil }
+	discoverBDMVPlaylists = func(context.Context, string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{}, nil
+	}
 
 	_, err := (&Service{repo: &fakeRepo{}}).resolveBDMVPlaylistSelection(context.Background(), preparationstate.Request{
 		Layout: sourcelayout.Layout{
@@ -926,12 +928,12 @@ func TestPersistDiscDVDMediaInfoKeepsSingleDiscSourceIdentity(t *testing.T) {
 func TestResolveBDMVPlaylistSelectionKeepsDuplicateBasenamesDiscScoped(t *testing.T) {
 	originalDiscover := discoverBDMVPlaylists
 	t.Cleanup(func() { discoverBDMVPlaylists = originalDiscover })
-	discoverBDMVPlaylists = func(_ context.Context, _ string) ([]filesystem.PlaylistInfo, error) {
-		return []filesystem.PlaylistInfo{{
+	discoverBDMVPlaylists = func(_ context.Context, _ string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{Playlists: []filesystem.PlaylistInfo{{
 			File:     "00001.MPLS",
 			Duration: 5400,
 			Score:    100,
-		}}, nil
+		}}}, nil
 	}
 
 	repo := &stubRepo{}
@@ -994,12 +996,12 @@ func TestCollectDiscEvidenceNamespacesDuplicatePlaylists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve layout: %v", err)
 	}
-	discoverBDMVPlaylists = func(_ context.Context, _ string) ([]filesystem.PlaylistInfo, error) {
-		return []filesystem.PlaylistInfo{{
+	discoverBDMVPlaylists = func(_ context.Context, _ string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{Playlists: []filesystem.PlaylistInfo{{
 			File:     "00001.MPLS",
 			Duration: 5400,
 			Score:    100,
-		}}, nil
+		}}}, nil
 	}
 	parseBDMVPlaylist = func(_ string) (float64, []filesystem.PlaylistItem, error) {
 		return 5400, []filesystem.PlaylistItem{{File: "00001.m2ts", Size: 100}}, nil
@@ -1066,8 +1068,8 @@ func TestCollectDiscEvidenceNamespacesDuplicatePlaylists(t *testing.T) {
 func TestResolveBDMVPlaylistSelectionRejectsIncompleteMultiDiscAtomically(t *testing.T) {
 	originalDiscover := discoverBDMVPlaylists
 	t.Cleanup(func() { discoverBDMVPlaylists = originalDiscover })
-	discoverBDMVPlaylists = func(_ context.Context, _ string) ([]filesystem.PlaylistInfo, error) {
-		return []filesystem.PlaylistInfo{{File: "00001.MPLS", Duration: 5400}}, nil
+	discoverBDMVPlaylists = func(_ context.Context, _ string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{Playlists: []filesystem.PlaylistInfo{{File: "00001.MPLS", Duration: 5400}}}, nil
 	}
 
 	repo := &stubRepo{}
@@ -1108,8 +1110,8 @@ func TestResolveBDMVPlaylistSelectionRejectsIncompleteMultiDiscAtomically(t *tes
 func TestResolveBDMVPlaylistSelectionRejectsStaleAndMultiDiscLegacyState(t *testing.T) {
 	originalDiscover := discoverBDMVPlaylists
 	t.Cleanup(func() { discoverBDMVPlaylists = originalDiscover })
-	discoverBDMVPlaylists = func(_ context.Context, _ string) ([]filesystem.PlaylistInfo, error) {
-		return []filesystem.PlaylistInfo{{File: "00001.MPLS", Duration: 5400}}, nil
+	discoverBDMVPlaylists = func(_ context.Context, _ string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{Playlists: []filesystem.PlaylistInfo{{File: "00001.MPLS", Duration: 5400}}}, nil
 	}
 
 	for _, storedFingerprint := range []string{"old-inventory", ""} {
@@ -1363,11 +1365,11 @@ func TestPrepareBDMVUsesCachedSummariesWithoutRescan(t *testing.T) {
 		parseBDInfoOutput = originalParseOutput
 	})
 
-	discoverBDMVPlaylists = func(_ context.Context, _ string) ([]filesystem.PlaylistInfo, error) {
-		return []filesystem.PlaylistInfo{
+	discoverBDMVPlaylists = func(_ context.Context, _ string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{Playlists: []filesystem.PlaylistInfo{
 			{File: "00001.MPLS", Duration: 5400},
 			{File: "00002.MPLS", Duration: 6000},
-		}, nil
+		}}, nil
 	}
 	parseBDMVPlaylist = func(mplsPath string) (float64, []filesystem.PlaylistItem, error) {
 		switch filepath.Base(strings.ToUpper(mplsPath)) {
@@ -1473,10 +1475,10 @@ func TestPrepareBDMVDirectPlaylistInvokesBDInfoForParentAndRoot(t *testing.T) {
 		parseBDInfoOutput = originalParseOutput
 	})
 
-	discoverBDMVPlaylists = func(_ context.Context, _ string) ([]filesystem.PlaylistInfo, error) {
-		return []filesystem.PlaylistInfo{
+	discoverBDMVPlaylists = func(_ context.Context, _ string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{Playlists: []filesystem.PlaylistInfo{
 			{File: "00001.MPLS", Duration: 5400},
-		}, nil
+		}}, nil
 	}
 	parseBDMVPlaylist = func(_ string) (float64, []filesystem.PlaylistItem, error) {
 		return 5400, []filesystem.PlaylistItem{
@@ -1607,11 +1609,11 @@ func TestPrepareBDMVPartialCacheRequiresConfirmation(t *testing.T) {
 	t.Cleanup(func() {
 		discoverBDMVPlaylists = originalDiscover
 	})
-	discoverBDMVPlaylists = func(_ context.Context, _ string) ([]filesystem.PlaylistInfo, error) {
-		return []filesystem.PlaylistInfo{
+	discoverBDMVPlaylists = func(_ context.Context, _ string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{Playlists: []filesystem.PlaylistInfo{
 			{File: "00001.MPLS", Duration: 5400},
 			{File: "00002.MPLS", Duration: 6000},
-		}, nil
+		}}, nil
 	}
 
 	tmpRoot, err := db.Subdir(cfg.MainSettings.DBPath, "tmp")
@@ -1673,11 +1675,11 @@ func TestPrepareBDMVPartialCacheRescansWhenConfirmed(t *testing.T) {
 		executeFullBDInfoScan = originalFullScan
 		parseBDInfoOutput = originalParseOutput
 	})
-	discoverBDMVPlaylists = func(_ context.Context, _ string) ([]filesystem.PlaylistInfo, error) {
-		return []filesystem.PlaylistInfo{
+	discoverBDMVPlaylists = func(_ context.Context, _ string) (filesystem.PlaylistReport, error) {
+		return filesystem.PlaylistReport{Playlists: []filesystem.PlaylistInfo{
 			{File: "00001.MPLS", Duration: 5400},
 			{File: "00002.MPLS", Duration: 6000},
-		}, nil
+		}}, nil
 	}
 	parseBDMVPlaylist = func(_ string) (float64, []filesystem.PlaylistItem, error) {
 		return 6000, []filesystem.PlaylistItem{{File: "00003.m2ts", Size: 200}}, nil

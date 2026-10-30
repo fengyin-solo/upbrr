@@ -96,7 +96,7 @@ type bdmvSummaryCache struct {
 var bdmvSummaryPlaylistPattern = regexp.MustCompile(`(?mi)^Playlist:\s*(.+?)\s*$`)
 
 var (
-	discoverBDMVPlaylists = filesystem.DiscoverPlaylists
+	discoverBDMVPlaylists = filesystem.ListPlaylists
 	parseBDMVPlaylist     = filesystem.ParseMPLS
 	executePlaylistBDInfo = func(svc *bdinfo.Service, ctx context.Context, bdmvPath string, playlistFile string, outputPath string, summaryOnly bool) (string, error) {
 		return svc.ExecuteForPlaylist(ctx, bdmvPath, playlistFile, outputPath, summaryOnly)
