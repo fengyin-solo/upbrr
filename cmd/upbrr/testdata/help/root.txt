@@ -30,6 +30,8 @@ Application:
       Show version and exit
   -cleanup, --cleanup
       Delete all stored database content for all releases and exit
+  -cleanup-preview, --cleanup-preview
+      Preview the impact of deleting all stored content and exit without deleting
 
 Execution:
   -queue, --queue string

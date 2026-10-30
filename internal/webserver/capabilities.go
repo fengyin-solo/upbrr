@@ -79,6 +79,7 @@ type HistoryCapability interface {
 	GetHistoryOverview(context.Context, string) (api.HistoryOverview, error)
 	DeleteHistoryRelease(context.Context, string) error
 	DeleteAllHistoryReleases(context.Context) (int, error)
+	PreviewDeleteAllHistoryReleases(context.Context) (api.HistoryDeleteAllPreview, error)
 }
 
 // DiagnosticProbeCapability reports availability of optional runtime tooling.

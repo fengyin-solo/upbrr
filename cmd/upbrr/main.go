@@ -227,7 +227,7 @@ func runUploadDriver(
 	if trackScoped && (len(paths) != 1 || strings.TrimSpace(opts.QueueName) != "") {
 		return exitError(2, errors.New("track-specific input corrections require exactly one source and cannot use --queue"))
 	}
-	if opts.LiveTest && (opts.CreateAuth || opts.ExportConfigPath != "" || opts.ImportConfigPath != "" || opts.Cleanup || opts.DeleteTmp) {
+	if opts.LiveTest && (opts.CreateAuth || opts.ExportConfigPath != "" || opts.ImportConfigPath != "" || opts.Cleanup || opts.CleanupPreview || opts.DeleteTmp) {
 		return exitError(2, errors.New("--live-test cannot be combined with configuration or stored-release maintenance; use live-test init or cleanup"))
 	}
 	if visitedFlags["live-test-max-images"] && !opts.LiveTest {
@@ -282,13 +282,25 @@ func runUploadDriver(
 	if opts.Cleanup && opts.DeleteTmp {
 		return exitError(2, errors.New("--cleanup and -dtmp cannot be used together"))
 	}
+	if opts.Cleanup && opts.CleanupPreview {
+		return exitError(2, errors.New("--cleanup and --cleanup-preview cannot be used together"))
+	}
+	if opts.CleanupPreview && opts.DeleteTmp {
+		return exitError(2, errors.New("--cleanup-preview and -dtmp cannot be used together"))
+	}
 	if opts.Cleanup && opts.UploadOnly {
 		return exitError(2, errors.New("--cleanup cannot be used with --upload-only"))
+	}
+	if opts.CleanupPreview && opts.UploadOnly {
+		return exitError(2, errors.New("--cleanup-preview cannot be used with --upload-only"))
 	}
 	if opts.Cleanup && len(paths) > 0 {
 		return exitError(2, errors.New("--cleanup does not accept input paths"))
 	}
-	if !opts.Cleanup && opts.HDRResumeWorkflow == "" && len(paths) == 0 {
+	if opts.CleanupPreview && len(paths) > 0 {
+		return exitError(2, errors.New("--cleanup-preview does not accept input paths"))
+	}
+	if !opts.Cleanup && !opts.CleanupPreview && opts.HDRResumeWorkflow == "" && len(paths) == 0 {
 		if strings.TrimSpace(opts.SiteUpload) != "" {
 			return exitError(2, errors.New("--site-upload currently requires at least one input path in the Go CLI"))
 		}
@@ -397,6 +409,15 @@ func runUploadDriver(
 			return exitError(2, errors.New("--hdr-resume-workflow does not accept input paths"))
 		}
 		return runCLIHDRResume(ctx, coreSvc, opts, streams, logger)
+	}
+
+	if opts.CleanupPreview {
+		preview, err := previewCLIStoredReleases(setupCtx, coreSvc)
+		if err != nil {
+			return exitError(1, err)
+		}
+		fmt.Fprint(streams.out, renderCLICleanupPreview(preview))
+		return nil
 	}
 
 	if opts.Cleanup {
@@ -1419,6 +1440,37 @@ func purgeCLIStoredReleases(ctx context.Context, coreSvc cliHistoryPurger) (int,
 		return count, fmt.Errorf("purge stored releases: %w", err)
 	}
 	return count, nil
+}
+
+// cliHistoryCleanupPreviewer previews full stored release history cleanup.
+type cliHistoryCleanupPreviewer interface {
+	PreviewDeleteAllHistoryReleases(context.Context) (api.HistoryDeleteAllPreview, error)
+}
+
+func previewCLIStoredReleases(ctx context.Context, coreSvc cliHistoryCleanupPreviewer) (api.HistoryDeleteAllPreview, error) {
+	preview, err := coreSvc.PreviewDeleteAllHistoryReleases(ctx)
+	if err != nil {
+		return api.HistoryDeleteAllPreview{}, fmt.Errorf("preview purge stored releases: %w", err)
+	}
+	return preview, nil
+}
+
+// renderCLICleanupPreview emits a stable, secret-free summary. Skip rows carry
+// only the user-owned source path and a stable reason code, never managed
+// artifact paths or raw internal errors.
+func renderCLICleanupPreview(preview api.HistoryDeleteAllPreview) string {
+	var builder strings.Builder
+	fmt.Fprintln(&builder, "stored release cleanup preview:")
+	fmt.Fprintf(&builder, "  deletable sources: %d\n", preview.Sources)
+	fmt.Fprintf(&builder, "  child sources: %d\n", preview.ChildSources)
+	fmt.Fprintf(&builder, "  files to delete: %d\n", preview.Files)
+	fmt.Fprintf(&builder, "  shared files kept: %d\n", preview.SharedFilesKept)
+	fmt.Fprintf(&builder, "  private workflows to close: %d\n", preview.PrivateWorkflows)
+	fmt.Fprintf(&builder, "  skipped sources: %d\n", len(preview.SkippedSources))
+	for _, skipped := range preview.SkippedSources {
+		fmt.Fprintf(&builder, "    %s (%s)\n", formatPathLabel(skipped.SourcePath), skipped.Reason)
+	}
+	return builder.String()
 }
 
 func deleteCLIStoredReleases(ctx context.Context, coreSvc cliHistoryReleaseDeleter, paths []string, output io.Writer) error {

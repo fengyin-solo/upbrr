@@ -331,6 +331,14 @@ type HistoryCleanupSnapshot struct {
 	WorkflowScopes []WorkflowScope
 }
 
+// HistoryArtifactReference ties one stored artifact path to the stored source
+// path that references it. Read-only preview planning uses it to compute
+// shared-artifact retention without purging any rows.
+type HistoryArtifactReference struct {
+	SourcePath string
+	ImagePath  string
+}
+
 // HistoryRepository owns persisted history projection, cleanup discovery, and
 // atomic release-state purge. Filesystem deletion remains outside this seam.
 type HistoryRepository interface {
@@ -342,6 +350,10 @@ type HistoryRepository interface {
 	WithHistoryDeletion(context.Context, func(context.Context) error) error
 	ListHistoryProtectedSourcePaths(ctx context.Context) ([]string, error)
 	ListStoredHistoryArtifactPaths(ctx context.Context) ([]string, error)
+	// ListStoredHistoryArtifactReferences returns distinct stored
+	// source-to-artifact references using the same artifact union as
+	// ListStoredHistoryArtifactPaths, without applying any purge.
+	ListStoredHistoryArtifactReferences(ctx context.Context) ([]HistoryArtifactReference, error)
 	ListStoredReleasePaths(ctx context.Context) ([]string, error)
 	PurgeContentData(ctx context.Context, path string) error
 }

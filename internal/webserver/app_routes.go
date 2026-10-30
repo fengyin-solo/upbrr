@@ -450,6 +450,15 @@ func (s *Server) registerAppRoutes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}))
 
+	mux.HandleFunc("/api/app/PreviewDeleteAllHistory", s.requireSession(func(w http.ResponseWriter, _ *http.Request, _ session) {
+		value, err := s.backend.PreviewDeleteAllHistory()
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, value)
+	}))
+
 	mux.HandleFunc("/api/app/GetLogPath", s.requireSession(func(w http.ResponseWriter, _ *http.Request, _ session) {
 		value, err := s.backend.GetLogPath()
 		if err != nil {

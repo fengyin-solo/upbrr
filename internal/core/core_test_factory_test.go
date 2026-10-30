@@ -46,6 +46,10 @@ func (stubRepo) ListStoredHistoryArtifactPaths(context.Context) ([]string, error
 	return nil, nil
 }
 
+func (stubRepo) ListStoredHistoryArtifactReferences(context.Context) ([]api.HistoryArtifactReference, error) {
+	return nil, nil
+}
+
 func (stubRepo) ListHistoryEntries(context.Context) ([]api.HistoryEntry, error) {
 	return nil, internalerrors.ErrNotImplemented
 }

@@ -1,7 +1,7 @@
 // Copyright (c) 2025-2026, Audionut and the autobrr contributors.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
@@ -317,5 +317,63 @@ describe("HistoryPage", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("previews the full cleanup impact without deleting anything", async () => {
+    const firstPath = "C:\\media\\First.Release.2026.1080p-GRP.mkv";
+    const skippedPath = "C:\\media\\Second.Release.2026.1080p-GRP.mkv";
+    const previewDeleteAll = vi.fn(async () => ({
+      Sources: 1,
+      ChildSources: 1,
+      Files: 4,
+      SharedFilesKept: 2,
+      PrivateWorkflows: 1,
+      SkippedSources: [{ SourcePath: skippedPath, Reason: "active_input" }],
+    }));
+    installAppOperationMocks({
+      ListHistory: async () => [
+        entry(firstPath, "First Release"),
+        entry(skippedPath, "Second Release"),
+      ],
+      GetHistoryOverview: async (path) =>
+        overview(path, path === firstPath ? "First Release" : "Second Release"),
+      PreviewDeleteAllHistory: previewDeleteAll,
+    });
+
+    renderHistory();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Preview full cleanup" }));
+
+    const previewRegion = await screen.findByRole("region", { name: "Full cleanup preview" });
+    expect(previewDeleteAll).toHaveBeenCalledTimes(1);
+    expect(within(previewRegion).getByText("Nothing is deleted while previewing.")).toBeInTheDocument();
+    const expectCount = (label: string, value: string) => {
+      const card = within(previewRegion).getByText(label).closest("article");
+      expect(card).not.toBeNull();
+      expect(within(card as HTMLElement).getByText(value)).toBeInTheDocument();
+    };
+    expectCount("Deletable sources", "1");
+    expectCount("Child sources", "1");
+    expectCount("Files to delete", "4");
+    expectCount("Shared files kept", "2");
+    expectCount("Private workflows to close", "1");
+    expectCount("Skipped sources", "1");
+    expect(within(previewRegion).getByText(skippedPath)).toBeInTheDocument();
+    expect(within(previewRegion).getByText("Active input")).toBeInTheDocument();
+
+    await user.click(within(previewRegion).getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("region", { name: "Full cleanup preview" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Preview full cleanup" })).toBeInTheDocument();
+  });
+
+  it("does not offer the full cleanup preview without stored releases", async () => {
+    installAppOperationMocks({
+      ListHistory: async () => [],
+    });
+
+    renderHistory();
+
+    expect(await screen.findByText("No stored releases found.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /full cleanup preview/i })).not.toBeInTheDocument();
   });
 });

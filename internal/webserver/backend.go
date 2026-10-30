@@ -859,6 +859,22 @@ func (b *Backend) DeleteHistoryRelease(sourcePath string) error {
 	return wrapWebError(historyCore.DeleteHistoryRelease(ctx, strings.TrimSpace(sourcePath)))
 }
 
+// PreviewDeleteAllHistory returns the read-only summary of a full-history
+// cleanup without modifying database rows, files, workflows or input leases.
+func (b *Backend) PreviewDeleteAllHistory() (api.HistoryDeleteAllPreview, error) {
+	rt, err := b.requireRuntime()
+	if err != nil {
+		return api.HistoryDeleteAllPreview{}, err
+	}
+	historyCore, err := rt.historyCore()
+	if err != nil {
+		return api.HistoryDeleteAllPreview{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), previewTimeout)
+	defer cancel()
+	return wrapWebResult(historyCore.PreviewDeleteAllHistoryReleases(ctx))
+}
+
 // GetLogPath returns the host filesystem path of the active application log.
 func (b *Backend) GetLogPath() (string, error) {
 	return wrapWebResult(logging.LogPath(b.currentConfig().MainSettings.DBPath))

@@ -82,6 +82,7 @@ type cliOptions struct {
 	ImportConfigPath           string
 	DeleteTmp                  bool
 	Cleanup                    bool
+	CleanupPreview             bool
 	TMDB                       string
 	TVDB                       string
 	TVmaze                     string
@@ -283,6 +284,7 @@ func bindUploadFlags(fs *pflag.FlagSet, opts *cliOptions) {
 	fs.BoolVar(&opts.DeleteTmp, "dtmp", false, "Delete stored database content for each input path before upload")
 	fs.BoolVar(&opts.DeleteTmp, "delete-tmp", false, "Delete stored database content for each input path before upload")
 	fs.BoolVar(&opts.Cleanup, "cleanup", false, "Delete all stored database content for all releases and exit")
+	fs.BoolVar(&opts.CleanupPreview, "cleanup-preview", false, "Preview the impact of deleting all stored content and exit without deleting")
 	fs.StringVar(&opts.Region, "region", "", "Override disc region")
 	fs.StringVar(&opts.Region, "reg", "", "Override disc region")
 	fs.StringVar(&opts.TMDB, "tmdb", "", "Override TMDB id; empty or 0 clears and skips this provider")
@@ -540,8 +542,8 @@ func normalizeCLIOptions(opts *cliOptions, visited map[string]bool) error {
 	if (visited["refresh-queue"] || visited["retry-queue"]) && opts.QueueName == "" {
 		return errors.New("--refresh-queue and --retry-queue require --queue")
 	}
-	if opts.QueueName != "" && (opts.Cleanup || opts.DeleteTmp) {
-		return errors.New("saved queues cannot be combined with --cleanup or --delete-tmp; manage stored releases separately")
+	if opts.QueueName != "" && (opts.Cleanup || opts.CleanupPreview || opts.DeleteTmp) {
+		return errors.New("saved queues cannot be combined with --cleanup, --cleanup-preview or --delete-tmp; manage stored releases separately")
 	}
 	if opts.ExportConfigPlaintext && !visited["export-config"] {
 		return errors.New("--export-config-plaintext requires --export-config")
@@ -896,7 +898,7 @@ func cliHelpSections(name string) []helpSection {
 	}
 	return []helpSection{
 		{title: "Config", names: []string{"config", "export-config", "export-config-plaintext", "import-config", "create-auth"}},
-		{title: "Application", names: []string{"version", "cleanup"}},
+		{title: "Application", names: []string{"version", "cleanup", "cleanup-preview"}},
 		{title: "Execution", names: []string{
 			"queue",
 			"limit-queue",

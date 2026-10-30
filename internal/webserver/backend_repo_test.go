@@ -1112,6 +1112,15 @@ func TestBackendRequestCapabilitiesRejectPartialRuntimeBundles(t *testing.T) {
 				return backend.DeleteHistoryRelease(path)
 			},
 		},
+		{
+			name:         "history preview delete all",
+			capabilities: incomplete,
+			want:         "history capability unavailable",
+			call: func(backend *Backend) error {
+				_, err := backend.PreviewDeleteAllHistory()
+				return err
+			},
+		},
 	}
 
 	for _, tt := range tests {

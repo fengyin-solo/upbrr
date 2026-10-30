@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,20 +23,22 @@ import (
 
 type cleanupRepo struct {
 	stubRepo
-	storedPaths    []string
-	screenshots    []api.Screenshot
-	uploaded       []api.UploadedImageLink
-	finals         []api.ScreenshotFinalSelection
-	slots          []api.ScreenshotSlot
-	stored         api.FileMetadata
-	getByPathErr   error
-	workflowScopes []api.WorkflowScope
-	protectedPaths []string
-	purgedPaths    []string
-	purgeCalls     int
-	purgeErr       error
-	purgeErrAt     int
-	cancel         context.CancelFunc
+	storedPaths      []string
+	screenshots      []api.Screenshot
+	uploaded         []api.UploadedImageLink
+	finals           []api.ScreenshotFinalSelection
+	slots            []api.ScreenshotSlot
+	stored           api.FileMetadata
+	getByPathErr     error
+	workflowScopes   []api.WorkflowScope
+	protectedPaths   []string
+	extraReferences  []api.HistoryArtifactReference
+	artifactRefsHook func()
+	purgedPaths      []string
+	purgeCalls       int
+	purgeErr         error
+	purgeErrAt       int
+	cancel           context.CancelFunc
 }
 
 type historyActiveInputRepoFake struct {
@@ -134,6 +137,39 @@ func (r *cleanupRepo) ListStoredReleasePaths(context.Context) ([]string, error) 
 
 func (r *cleanupRepo) ListHistoryProtectedSourcePaths(context.Context) ([]string, error) {
 	return append([]string(nil), r.protectedPaths...), nil
+}
+
+func (r *cleanupRepo) ListStoredHistoryArtifactReferences(context.Context) ([]api.HistoryArtifactReference, error) {
+	if r.artifactRefsHook != nil {
+		r.artifactRefsHook()
+	}
+	references := make([]api.HistoryArtifactReference, 0)
+	add := func(sourcePath, imagePath string) {
+		if strings.TrimSpace(imagePath) == "" {
+			return
+		}
+		references = append(references, api.HistoryArtifactReference{
+			SourcePath: sourcePath,
+			ImagePath:  imagePath,
+		})
+	}
+	for _, shot := range r.screenshots {
+		add(shot.SourcePath, shot.ImagePath)
+	}
+	for _, image := range r.uploaded {
+		add(image.SourcePath, image.ImagePath)
+	}
+	for _, image := range r.finals {
+		add(image.SourcePath, image.ImagePath)
+	}
+	for _, slot := range r.slots {
+		add(slot.SourcePath, slot.ImagePath)
+		for _, variant := range slot.Variants {
+			add(variant.SourcePath, variant.ImagePath)
+		}
+	}
+	references = append(references, r.extraReferences...)
+	return references, nil
 }
 
 func (r *cleanupRepo) PurgeContentData(_ context.Context, path string) error {
@@ -1095,4 +1131,423 @@ func TestRemoveIfWithinRootKeepsAliasedRoot(t *testing.T) {
 	if _, err := os.Stat(sentinel); err != nil {
 		t.Fatalf("expected root contents to remain: %v", err)
 	}
+}
+
+func openPreviewHistoryRepo(t *testing.T) *db.SQLiteRepository {
+	t.Helper()
+	repo, err := db.Open(filepath.Join(t.TempDir(), "history.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	if err := repo.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	return repo
+}
+
+func writePreviewArtifact(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir preview artifact dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("preview artifact"), 0o600); err != nil {
+		t.Fatalf("write preview artifact: %v", err)
+	}
+}
+
+func assertHistoryPreview(t *testing.T, got api.HistoryDeleteAllPreview, want api.HistoryDeleteAllPreview) {
+	t.Helper()
+	if got.Sources != want.Sources || got.ChildSources != want.ChildSources ||
+		got.Files != want.Files || got.SharedFilesKept != want.SharedFilesKept ||
+		got.PrivateWorkflows != want.PrivateWorkflows || len(got.SkippedSources) != len(want.SkippedSources) {
+		t.Fatalf("preview = %+v, want %+v", got, want)
+	}
+	for index := range want.SkippedSources {
+		if got.SkippedSources[index] != want.SkippedSources[index] {
+			t.Fatalf("preview skip %d = %+v, want %+v; full preview %+v", index, got.SkippedSources[index], want.SkippedSources[index], got)
+		}
+	}
+}
+
+func TestHistoryPreviewDeleteAllEmptyReturnsZeroCounters(t *testing.T) {
+	t.Parallel()
+
+	repo := openPreviewHistoryRepo(t)
+	history := newHistoryModule(repo, repo.DBPath(), api.NopLogger{})
+
+	preview, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("preview empty history: %v", err)
+	}
+	assertHistoryPreview(t, preview, api.HistoryDeleteAllPreview{})
+	if preview.SkippedSources == nil {
+		t.Fatal("skipped sources should serialize as an empty list")
+	}
+}
+
+func TestHistoryPreviewDeleteAllCountsSourceFilesAndPrivateWorkflows(t *testing.T) {
+	t.Parallel()
+
+	repo := openPreviewHistoryRepo(t)
+	baseDir := t.TempDir()
+	sourcePath := filepath.Join(baseDir, "sources", "Example.Movie.2024.mkv")
+	writePreviewArtifact(t, sourcePath)
+	now := time.Date(2026, time.July, 25, 12, 0, 0, 0, time.UTC)
+	workflow := historySubmissionWorkflowState(t, sourcePath, now)
+	if _, _, err := repo.CreateReleaseWorkflowState(t.Context(), workflow); err != nil {
+		t.Fatalf("create history workflow: %v", err)
+	}
+	if err := repo.Save(t.Context(), db.FileMetadata{Path: sourcePath, UpdatedAt: now}); err != nil {
+		t.Fatalf("save history source: %v", err)
+	}
+	tmpRoot, err := db.Subdir(repo.DBPath(), "tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstImage := filepath.Join(tmpRoot, "generated", "shot-01.png")
+	secondImage := filepath.Join(tmpRoot, "generated", "shot-02.png")
+	writePreviewArtifact(t, firstImage)
+	writePreviewArtifact(t, secondImage)
+	insertHistoryReusableArtifact(t, repo, sourcePath, firstImage, now)
+	insertHistoryReusableArtifact(t, repo, sourcePath, secondImage, now)
+
+	vault, err := releaseworkflow.NewPrivateArtifactVault(t.TempDir())
+	if err != nil {
+		t.Fatalf("new private artifact vault: %v", err)
+	}
+	scope := api.WorkflowScope{OwnerID: workflow.OwnerID, WorkflowID: workflow.WorkflowID}
+	if err := vault.Put(
+		scope.OwnerID,
+		scope.WorkflowID,
+		"preview:keep",
+		releaseworkflow.MediaPreviewContent{Bytes: []byte("private"), ContentType: "image/png"},
+		now.Add(time.Hour),
+	); err != nil {
+		t.Fatalf("put private artifact: %v", err)
+	}
+	history := newHistoryModule(repo, repo.DBPath(), api.NopLogger{})
+	history.privateVault = vault
+
+	want := api.HistoryDeleteAllPreview{
+		Sources:          1,
+		Files:            2,
+		PrivateWorkflows: 1,
+		SkippedSources:   []api.HistoryDeletePreviewSkip{},
+	}
+	first, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, first, want)
+
+	// Repeated previews must not mutate files, rows, vault state or leases.
+	for _, target := range []string{firstImage, secondImage, sourcePath} {
+		if _, err := os.Stat(target); err != nil {
+			t.Fatalf("preview changed %s: %v", target, err)
+		}
+	}
+	if _, err := repo.GetByPath(t.Context(), sourcePath); err != nil {
+		t.Fatalf("preview purged metadata row: %v", err)
+	}
+	if _, err := repo.LoadReleaseWorkflowState(t.Context(), scope.OwnerID, scope.WorkflowID); err != nil {
+		t.Fatalf("preview closed workflow state: %v", err)
+	}
+	if _, err := vault.Get(scope.OwnerID, scope.WorkflowID, "preview:keep", now); err != nil {
+		t.Fatalf("preview removed private artifact: %v", err)
+	}
+	second, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("second preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, second, want)
+}
+
+func TestHistoryPreviewDeleteAllGroupsParentAndChildSources(t *testing.T) {
+	t.Parallel()
+
+	repo := openPreviewHistoryRepo(t)
+	baseDir := t.TempDir()
+	sourceDir := filepath.Join(baseDir, "sources", "Example.Season.2024")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	childPath := filepath.Join(sourceDir, "Example.Season.2024.E01.mkv")
+	writePreviewArtifact(t, childPath)
+	now := time.Now().UTC()
+	for _, sourcePath := range []string{sourceDir, childPath} {
+		if err := repo.Save(t.Context(), db.FileMetadata{Path: sourcePath, UpdatedAt: now}); err != nil {
+			t.Fatalf("save history source %q: %v", sourcePath, err)
+		}
+	}
+	tmpRoot, err := db.Subdir(repo.DBPath(), "tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentImage := filepath.Join(tmpRoot, "generated", "parent.png")
+	childImage := filepath.Join(tmpRoot, "generated", "child.png")
+	writePreviewArtifact(t, parentImage)
+	writePreviewArtifact(t, childImage)
+	insertHistoryReusableArtifact(t, repo, sourceDir, parentImage, now)
+	insertHistoryReusableArtifact(t, repo, childPath, childImage, now)
+	history := newHistoryModule(repo, repo.DBPath(), api.NopLogger{})
+
+	want := api.HistoryDeleteAllPreview{
+		Sources:        1,
+		ChildSources:   1,
+		Files:          2,
+		SkippedSources: []api.HistoryDeletePreviewSkip{},
+	}
+	first, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, first, want)
+	for _, target := range []string{parentImage, childImage, childPath} {
+		if _, err := os.Stat(target); err != nil {
+			t.Fatalf("preview changed %s: %v", target, err)
+		}
+	}
+	for _, sourcePath := range []string{sourceDir, childPath} {
+		if _, err := repo.GetByPath(t.Context(), sourcePath); err != nil {
+			t.Fatalf("preview purged metadata row %q: %v", sourcePath, err)
+		}
+	}
+	second, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("second preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, second, want)
+}
+
+func TestHistoryPreviewDeleteAllCountsSharedImageOnce(t *testing.T) {
+	t.Parallel()
+
+	repo := openPreviewHistoryRepo(t)
+	baseDir := t.TempDir()
+	sourceA := filepath.Join(baseDir, "sources", "Example.A.2024.mkv")
+	sourceB := filepath.Join(baseDir, "sources", "Example.B.2024.mkv")
+	writePreviewArtifact(t, sourceA)
+	writePreviewArtifact(t, sourceB)
+	now := time.Now().UTC()
+	for _, sourcePath := range []string{sourceA, sourceB} {
+		if err := repo.Save(t.Context(), db.FileMetadata{
+			Path:      sourcePath,
+			InfoHash:  filepath.Base(sourcePath),
+			UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("save history source: %v", err)
+		}
+	}
+	tmpRoot, err := db.Subdir(repo.DBPath(), "tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedDir := filepath.Join(tmpRoot, "shared-output", "nested")
+	sharedImage := filepath.Join(sharedDir, "shared.png")
+	privateImage := filepath.Join(sharedDir, "private.png")
+	writePreviewArtifact(t, sharedImage)
+	writePreviewArtifact(t, privateImage)
+	insertHistoryReusableArtifact(t, repo, sourceA, sharedImage, now)
+	insertHistoryReusableArtifact(t, repo, sourceB, sharedImage, now)
+	insertHistoryReusableArtifact(t, repo, sourceA, privateImage, now)
+	history := newHistoryModule(repo, repo.DBPath(), api.NopLogger{})
+
+	want := api.HistoryDeleteAllPreview{
+		Sources:        2,
+		Files:          2,
+		SkippedSources: []api.HistoryDeletePreviewSkip{},
+	}
+	first, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, first, want)
+	if _, err := os.Stat(sharedImage); err != nil {
+		t.Fatalf("preview changed shared image: %v", err)
+	}
+	second, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("second preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, second, want)
+}
+
+func TestHistoryPreviewDeleteAllKeepsImageSharedWithActiveSource(t *testing.T) {
+	t.Parallel()
+
+	repo := openPreviewHistoryRepo(t)
+	baseDir := t.TempDir()
+	sourceA := filepath.Join(baseDir, "sources", "Example.A.2024.mkv")
+	sourceB := filepath.Join(baseDir, "sources", "Example.B.2024.mkv")
+	for _, sourcePath := range []string{sourceA, sourceB} {
+		writePreviewArtifact(t, sourcePath)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, sourcePath := range []string{sourceA, sourceB} {
+		if err := repo.Save(t.Context(), db.FileMetadata{Path: sourcePath, UpdatedAt: now}); err != nil {
+			t.Fatalf("save history source: %v", err)
+		}
+	}
+	tmpRoot, err := db.Subdir(repo.DBPath(), "tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedDir := filepath.Join(tmpRoot, "shared-output", "nested")
+	sharedImage := filepath.Join(sharedDir, "shared.png")
+	privateImage := filepath.Join(sharedDir, "private.png")
+	writePreviewArtifact(t, sharedImage)
+	writePreviewArtifact(t, privateImage)
+	insertHistoryReusableArtifact(t, repo, sourceA, sharedImage, now)
+	insertHistoryReusableArtifact(t, repo, sourceB, sharedImage, now)
+	insertHistoryReusableArtifact(t, repo, sourceA, privateImage, now)
+	activateHistoryInput(t, repo, sourceB, now)
+	history := newHistoryModule(repo, repo.DBPath(), api.NopLogger{})
+
+	want := api.HistoryDeleteAllPreview{
+		Sources:         1,
+		Files:           1,
+		SharedFilesKept: 1,
+		SkippedSources: []api.HistoryDeletePreviewSkip{{
+			SourcePath: sourceB,
+			Reason:     api.HistoryDeleteSkipActiveInput,
+		}},
+	}
+	first, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, first, want)
+	for _, target := range []string{sharedImage, privateImage} {
+		if _, err := os.Stat(target); err != nil {
+			t.Fatalf("preview changed %s: %v", target, err)
+		}
+	}
+	if _, err := repo.GetByPath(t.Context(), sourceB); err != nil {
+		t.Fatalf("preview purged active source row: %v", err)
+	}
+	active, err := repo.LoadActiveInput(t.Context())
+	if err != nil {
+		t.Fatalf("load active input after preview: %v", err)
+	}
+	if active.State != api.ActiveInputActive || active.InputID != "history-active-input" {
+		t.Fatalf("preview changed active input lease: %#v", active)
+	}
+	second, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("second preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, second, want)
+}
+
+func TestHistoryPreviewDeleteAllSkipsPathProtectedSource(t *testing.T) {
+	t.Parallel()
+
+	repo := openPreviewHistoryRepo(t)
+	tmpRoot, err := db.Subdir(repo.DBPath(), "tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(tmpRoot, "managed-source.mkv")
+	writePreviewArtifact(t, sourcePath)
+	if err := repo.Save(t.Context(), db.FileMetadata{Path: sourcePath, UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("save history source: %v", err)
+	}
+	history := newHistoryModule(repo, repo.DBPath(), api.NopLogger{})
+
+	want := api.HistoryDeleteAllPreview{SkippedSources: []api.HistoryDeletePreviewSkip{{
+		SourcePath: sourcePath,
+		Reason:     api.HistoryDeleteSkipPathProtected,
+	}}}
+	first, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, first, want)
+	if _, err := os.Stat(sourcePath); err != nil {
+		t.Fatalf("preview changed protected source: %v", err)
+	}
+	if _, err := repo.GetByPath(t.Context(), sourcePath); err != nil {
+		t.Fatalf("preview purged protected source row: %v", err)
+	}
+	second, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("second preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, second, want)
+}
+
+func TestHistoryPreviewDeleteAllReportsActiveInputSkipAndDoesNotPurge(t *testing.T) {
+	t.Parallel()
+
+	baseDir := t.TempDir()
+	activeSource := filepath.Join(baseDir, "active.mkv")
+	otherSource := filepath.Join(baseDir, "other.mkv")
+	repo := &cleanupRepo{
+		storedPaths:  []string{activeSource, otherSource},
+		getByPathErr: internalerrors.ErrNotFound,
+	}
+	history := newHistoryModule(repo, filepath.Join(baseDir, "ua.db"), api.NopLogger{})
+	history.activeInputs = historyActiveInputRepoFake{
+		slot:   api.ActiveInputRecord{State: api.ActiveInputActive, InputID: "preview-active"},
+		record: api.InputRecord{ID: "preview-active", CanonicalPath: activeSource},
+	}
+
+	want := api.HistoryDeleteAllPreview{
+		Sources: 1,
+		SkippedSources: []api.HistoryDeletePreviewSkip{{
+			SourcePath: activeSource,
+			Reason:     api.HistoryDeleteSkipActiveInput,
+		}},
+	}
+	first, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, first, want)
+	if repo.purgeCalls != 0 {
+		t.Fatalf("preview purged database rows: %#v", repo.purgedPaths)
+	}
+	second, err := history.PreviewDeleteAll(t.Context())
+	if err != nil {
+		t.Fatalf("second preview delete all: %v", err)
+	}
+	assertHistoryPreview(t, second, want)
+}
+
+func TestHistoryPreviewDeleteAllHonorsCancellation(t *testing.T) {
+	t.Parallel()
+
+	baseDir := t.TempDir()
+
+	t.Run("precanceled", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		repo := &cleanupRepo{
+			storedPaths:  []string{filepath.Join(baseDir, "one.mkv"), filepath.Join(baseDir, "two.mkv")},
+			getByPathErr: internalerrors.ErrNotFound,
+		}
+		history := newHistoryModule(repo, filepath.Join(baseDir, "ua.db"), api.NopLogger{})
+		if _, err := history.PreviewDeleteAll(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("preview delete all = %v", err)
+		}
+	})
+
+	t.Run("between sources", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		repo := &cleanupRepo{
+			storedPaths:      []string{filepath.Join(baseDir, "one.mkv"), filepath.Join(baseDir, "two.mkv")},
+			getByPathErr:     internalerrors.ErrNotFound,
+			artifactRefsHook: cancel,
+		}
+		history := newHistoryModule(repo, filepath.Join(baseDir, "ua.db"), api.NopLogger{})
+		if _, err := history.PreviewDeleteAll(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("preview delete all = %v", err)
+		}
+		if repo.purgeCalls != 0 {
+			t.Fatalf("canceled preview purged rows: %#v", repo.purgedPaths)
+		}
+	})
 }

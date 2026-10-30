@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -119,48 +120,99 @@ func (h *historyModule) cleanupOrphanedHistory(ctx context.Context, repo *db.SQL
 }
 
 func (h *historyModule) deleteStoredReleaseInTransaction(ctx context.Context, sourcePath string) error {
-	cleanupPaths, err := h.releaseCleanupPaths(ctx, sourcePath)
+	plan, err := h.planStoredReleaseData(ctx, sourcePath)
 	if err != nil {
 		return err
 	}
-	if err := h.deleteStoredReleaseData(ctx, sourcePath, cleanupPaths); err != nil {
+	if err := h.executeStoredReleasePlan(ctx, plan); err != nil {
 		return err
 	}
 	if h.preparedFacts != nil {
-		for _, cleanupPath := range cleanupPaths {
+		for _, cleanupPath := range plan.cleanupPaths {
 			h.preparedFacts.Invalidate(cleanupPath)
 		}
 	}
 	return nil
 }
 
-func (h *historyModule) deleteStoredReleaseData(ctx context.Context, sourcePath string, cleanupPaths []string) error {
+// historyReleasePlan captures the read-only result of the shared cleanup
+// policy checks. Deletion executes the plan; the full-cleanup preview
+// aggregates plans without performing any of the mutations.
+type historyReleasePlan struct {
+	sourcePath         string
+	cleanupPaths       []string
+	tmpRoot            string
+	fileRoots          []string
+	artifactPaths      []string
+	removableArtifacts []string
+	tmpDirs            map[string]struct{}
+	removableTmpDirs   []string
+	workflowScopes     []api.WorkflowScope
+}
+
+// historyDeferError preserves api.ErrActiveInputBusy identity while recording
+// which cleanup guard rejected the source, so preview planning can report a
+// stable skip reason. Real deletion behavior and error identity are unchanged.
+type historyDeferError struct {
+	reason api.HistoryDeleteSkipReason
+	cause  error
+}
+
+func newHistoryDeferError(reason api.HistoryDeleteSkipReason, cause error) error {
+	if !errors.Is(cause, api.ErrActiveInputBusy) {
+		return cause
+	}
+	return &historyDeferError{reason: reason, cause: cause}
+}
+
+func (e *historyDeferError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *historyDeferError) Unwrap() error {
+	return e.cause
+}
+
+// planStoredReleaseData runs the exact source association, active-input,
+// root containment and path-protection decisions used by deletion, without
+// purging rows, removing files, closing workflows or touching input leases.
+func (h *historyModule) planStoredReleaseData(ctx context.Context, sourcePath string) (historyReleasePlan, error) {
+	var plan historyReleasePlan
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("core: delete stored release canceled: %w", err)
+		return plan, fmt.Errorf("core: delete stored release canceled: %w", err)
 	}
 	trimmedPath := strings.TrimSpace(sourcePath)
 	if trimmedPath == "" {
-		return internalerrors.ErrInvalidInput
+		return plan, internalerrors.ErrInvalidInput
 	}
 	if h == nil || h.repo == nil {
-		return errors.New("core: repository not initialized")
+		return plan, errors.New("core: repository not initialized")
 	}
+	plan.sourcePath = trimmedPath
 
 	tmpRoot, err := db.Subdir(h.dbPath, "tmp")
 	if err != nil {
-		return fmt.Errorf("core: delete history release: resolve tmp dir: %w", err)
+		return plan, fmt.Errorf("core: delete history release: resolve tmp dir: %w", err)
 	}
 	cacheRoot, err := db.Subdir(h.dbPath, "cache")
 	if err != nil {
-		return fmt.Errorf("core: delete history release: resolve cache dir: %w", err)
+		return plan, fmt.Errorf("core: delete history release: resolve cache dir: %w", err)
 	}
 	nfoRoot, err := db.Subdir(h.dbPath, "nfo")
 	if err != nil {
-		return fmt.Errorf("core: delete history release: resolve nfo dir: %w", err)
+		return plan, fmt.Errorf("core: delete history release: resolve nfo dir: %w", err)
 	}
+	plan.tmpRoot = tmpRoot
+	plan.fileRoots = []string{tmpRoot, cacheRoot, nfoRoot}
+
+	cleanupPaths, err := h.releaseCleanupPaths(ctx, trimmedPath)
+	if err != nil {
+		return plan, err
+	}
+	plan.cleanupPaths = cleanupPaths
 
 	if err := h.ensureHistoryDeletionInactive(ctx, cleanupPaths); err != nil {
-		return err
+		return plan, newHistoryDeferError(api.HistoryDeleteSkipActiveInput, err)
 	}
 
 	artifactPaths := make([]string, 0)
@@ -169,7 +221,10 @@ func (h *historyModule) deleteStoredReleaseData(ctx context.Context, sourcePath 
 	for _, cleanupPath := range cleanupPaths {
 		pathArtifacts, pathTmpDirs, pathWorkflowScopes, err := h.collectReleaseCleanupTargets(ctx, cleanupPath, tmpRoot)
 		if err != nil {
-			return err
+			if errors.Is(err, api.ErrActiveInputBusy) {
+				return plan, newHistoryDeferError(api.HistoryDeleteSkipActiveInput, err)
+			}
+			return plan, err
 		}
 		artifactPaths = append(artifactPaths, pathArtifacts...)
 		workflowScopes = append(workflowScopes, pathWorkflowScopes...)
@@ -179,44 +234,62 @@ func (h *historyModule) deleteStoredReleaseData(ctx context.Context, sourcePath 
 	}
 
 	addDirectoryChildTempDirs(h.fs, trimmedPath, tmpRoot, tmpDirs)
+	plan.artifactPaths = artifactPaths
+	plan.tmpDirs = tmpDirs
 
-	fileRoots := []string{tmpRoot, cacheRoot, nfoRoot}
 	removableArtifacts := make([]string, 0, len(artifactPaths))
 	for _, filePath := range artifactPaths {
-		removable, err := ensureRemovableWithinRootsFS(h.fs, fileRoots, filePath, false)
+		removable, err := ensureRemovableWithinRootsFS(h.fs, plan.fileRoots, filePath, false)
 		if err != nil {
-			return fmt.Errorf("core: delete history release validate file %q: %w", filePath, err)
+			return plan, fmt.Errorf("core: delete history release validate file %q: %w", filePath, err)
 		}
 		if removable {
 			removableArtifacts = append(removableArtifacts, filePath)
 		}
 	}
+	plan.removableArtifacts = removableArtifacts
 	removableTmpDirs := make([]string, 0, len(tmpDirs))
 	for dir := range tmpDirs {
 		removable, err := ensureRemovableWithinRootFS(h.fs, tmpRoot, dir, true)
 		if err != nil {
-			return fmt.Errorf("core: delete history release validate tmp dir %q: %w", dir, err)
+			return plan, fmt.Errorf("core: delete history release validate tmp dir %q: %w", dir, err)
 		}
 		if removable {
 			removableTmpDirs = append(removableTmpDirs, dir)
 		}
 	}
+	plan.removableTmpDirs = removableTmpDirs
 	storedSourcePaths, err := h.repo.ListStoredReleasePaths(ctx)
 	if err != nil {
-		return fmt.Errorf("core: delete history release list stored source paths: %w", err)
+		return plan, fmt.Errorf("core: delete history release list stored source paths: %w", err)
 	}
 	protectedSourcePaths, err := h.repo.ListHistoryProtectedSourcePaths(ctx)
 	if err != nil {
-		return fmt.Errorf("core: delete history release protected source paths: %w", err)
+		if errors.Is(err, api.ErrActiveInputBusy) {
+			return plan, newHistoryDeferError(api.HistoryDeleteSkipPathProtected, err)
+		}
+		return plan, fmt.Errorf("core: delete history release protected source paths: %w", err)
 	}
 	if err := ensureHistoryTempTargetsUnprotected(tmpRoot, artifactPaths, tmpDirs, protectedSourcePaths); err != nil {
-		return err
+		return plan, newHistoryDeferError(api.HistoryDeleteSkipPathProtected, err)
 	}
 	knownSourcePaths := compactStrings(append(append(append([]string{trimmedPath}, cleanupPaths...), storedSourcePaths...), protectedSourcePaths...))
 	if err := ensureHistoryCleanupTargetsDoNotContainSources(removableArtifacts, removableTmpDirs, knownSourcePaths); err != nil {
-		return err
+		return plan, newHistoryDeferError(api.HistoryDeleteSkipPathProtected, err)
 	}
-	for _, cleanupPath := range cleanupPaths {
+	plan.workflowScopes = workflowScopes
+	return plan, nil
+}
+
+// executeStoredReleasePlan performs the mutation half of cleanup in the same
+// order as the original single-transaction deletion: purge rows, reread the
+// post-purge shared-artifact set, close private workflow vault artifacts, then
+// remove only unshared files and empty managed directories.
+func (h *historyModule) executeStoredReleasePlan(ctx context.Context, plan historyReleasePlan) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("core: delete stored release canceled: %w", err)
+	}
+	for _, cleanupPath := range plan.cleanupPaths {
 		if err := h.repo.PurgeContentData(ctx, cleanupPath); err != nil {
 			return fmt.Errorf("core: delete history release: %w", err)
 		}
@@ -225,14 +298,14 @@ func (h *historyModule) deleteStoredReleaseData(ctx context.Context, sourcePath 
 	if err != nil {
 		return fmt.Errorf("core: delete history release retained artifacts: %w", err)
 	}
-	if err := h.deletePrivateWorkflowScopes(workflowScopes); err != nil {
+	if err := h.deletePrivateWorkflowScopes(plan.workflowScopes); err != nil {
 		return err
 	}
-	for _, filePath := range artifactPaths {
+	for _, filePath := range plan.artifactPaths {
 		if historyArtifactRetained(filePath, retainedArtifacts) {
 			continue
 		}
-		removed, err := removeIfWithinRootsFS(h.fs, fileRoots, filePath, false)
+		removed, err := removeIfWithinRootsFS(h.fs, plan.fileRoots, filePath, false)
 		if err != nil {
 			return fmt.Errorf("core: delete history release remove file %q: %w", filePath, err)
 		}
@@ -240,8 +313,8 @@ func (h *historyModule) deleteStoredReleaseData(ctx context.Context, sourcePath 
 			h.logger.Debugf("core: delete history release removed file %s", filePath)
 		}
 	}
-	for dir := range tmpDirs {
-		removed, err := removeHistoryTempDirFS(h.fs, tmpRoot, dir, retainedArtifacts)
+	for dir := range plan.tmpDirs {
+		removed, err := removeHistoryTempDirFS(h.fs, plan.tmpRoot, dir, retainedArtifacts)
 		if err != nil {
 			return fmt.Errorf("core: delete history release remove tmp dir %q: %w", dir, err)
 		}
@@ -250,6 +323,162 @@ func (h *historyModule) deleteStoredReleaseData(ctx context.Context, sourcePath 
 		}
 	}
 	return nil
+}
+
+// PreviewDeleteAll returns the stable, read-only summary of what DeleteAll
+// would remove. It replays deletion's sequential grouping against the same
+// guard and shared-artifact reads, but never starts the deletion transaction,
+// purges database rows, removes files, closes private workflows or changes
+// active-input leases. Repeated calls have no side effects.
+func (h *historyModule) PreviewDeleteAll(ctx context.Context) (api.HistoryDeleteAllPreview, error) {
+	preview := api.HistoryDeleteAllPreview{SkippedSources: []api.HistoryDeletePreviewSkip{}}
+	if err := ctx.Err(); err != nil {
+		return preview, fmt.Errorf("core: preview delete all history releases canceled: %w", err)
+	}
+	if h == nil || h.repo == nil {
+		return preview, errors.New("core: repository not initialized")
+	}
+
+	storedPaths, err := h.repo.ListStoredReleasePaths(ctx)
+	if err != nil {
+		return preview, fmt.Errorf("core: list stored release paths: %w", err)
+	}
+	storedPaths = compactStrings(storedPaths)
+	slices.Sort(storedPaths)
+	if len(storedPaths) == 0 {
+		return preview, nil
+	}
+
+	// Artifact-to-owner references come from the same artifact union the
+	// deletion rereads after each purge. Decrementing owners in deletion order
+	// reproduces the post-purge retention set without mutating any rows.
+	references, err := h.repo.ListStoredHistoryArtifactReferences(ctx)
+	if err != nil {
+		return preview, fmt.Errorf("core: preview delete all history artifact references: %w", err)
+	}
+	artifactOwners := make(map[string]map[string]struct{})
+	for _, reference := range references {
+		artifactKey := historyCleanupPathKey(reference.ImagePath)
+		ownerKey := historyCleanupPathKey(reference.SourcePath)
+		if artifactKey == "" || ownerKey == "" {
+			continue
+		}
+		owners := artifactOwners[artifactKey]
+		if owners == nil {
+			owners = make(map[string]struct{})
+			artifactOwners[artifactKey] = owners
+		}
+		owners[ownerKey] = struct{}{}
+	}
+
+	claimedSources := make(map[string]struct{})
+	purgedOwners := make(map[string]struct{})
+	removedFiles := make(map[string]struct{})
+	keptFiles := make(map[string]struct{})
+	closedWorkflows := make(map[string]struct{})
+
+	for _, sourcePath := range storedPaths {
+		if err := ctx.Err(); err != nil {
+			return preview, fmt.Errorf("core: preview delete all history releases canceled: %w", err)
+		}
+		if _, claimed := claimedSources[historyCleanupPathKey(sourcePath)]; claimed {
+			continue
+		}
+		plan, planErr := h.planStoredReleaseData(ctx, sourcePath)
+		if planErr != nil {
+			var deferred *historyDeferError
+			if errors.As(planErr, &deferred) {
+				preview.SkippedSources = append(preview.SkippedSources, api.HistoryDeletePreviewSkip{
+					SourcePath: sourcePath,
+					Reason:     deferred.reason,
+				})
+				if h.logger != nil {
+					h.logger.Debugf("core: preview delete all history decision=skip source=%s reason=%s", sourcePath, deferred.reason)
+				}
+				continue
+			}
+			return preview, fmt.Errorf("core: preview delete all history release: %w", planErr)
+		}
+
+		preview.Sources++
+		rootKey := historyCleanupPathKey(plan.sourcePath)
+		for _, cleanupPath := range plan.cleanupPaths {
+			key := historyCleanupPathKey(cleanupPath)
+			claimedSources[key] = struct{}{}
+			purgedOwners[key] = struct{}{}
+			if key != rootKey {
+				preview.ChildSources++
+			}
+		}
+
+		for _, artifactPath := range plan.removableArtifacts {
+			key := historyCleanupPathKey(artifactPath)
+			if key == "" {
+				continue
+			}
+			retained := false
+			for owner := range artifactOwners[key] {
+				if _, purged := purgedOwners[owner]; !purged {
+					retained = true
+					break
+				}
+			}
+			if retained {
+				keptFiles[key] = struct{}{}
+				delete(removedFiles, key)
+				continue
+			}
+			delete(keptFiles, key)
+			removedFiles[key] = struct{}{}
+		}
+
+		for _, scope := range plan.workflowScopes {
+			ownerID := strings.TrimSpace(scope.OwnerID)
+			workflowID := strings.TrimSpace(string(scope.WorkflowID))
+			if ownerID == "" || workflowID == "" {
+				continue
+			}
+			key := ownerID + "\x00" + workflowID
+			if _, exists := closedWorkflows[key]; exists {
+				continue
+			}
+			closedWorkflows[key] = struct{}{}
+			preview.PrivateWorkflows++
+		}
+	}
+
+	preview.Files = len(removedFiles)
+	preview.SharedFilesKept = len(keptFiles)
+	if h.logger != nil {
+		h.logger.Infof(
+			"core: preview delete all history sources=%d child_sources=%d files=%d shared_kept=%d private_workflows=%d skipped=%d",
+			preview.Sources,
+			preview.ChildSources,
+			preview.Files,
+			preview.SharedFilesKept,
+			preview.PrivateWorkflows,
+			len(preview.SkippedSources),
+		)
+	}
+	return preview, nil
+}
+
+// historyCleanupPathKey normalizes local paths for stable cross-run
+// comparisons using the same absolute, case-folded identity as
+// pathutil.SamePath on the host OS.
+func historyCleanupPathKey(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(filepath.Clean(trimmed))
+	if err != nil {
+		abs = filepath.Clean(trimmed)
+	}
+	if runtime.GOOS == "windows" {
+		abs = strings.ToLower(abs)
+	}
+	return abs
 }
 
 func historyArtifactRetained(target string, retainedArtifacts []string) bool {

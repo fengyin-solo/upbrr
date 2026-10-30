@@ -41,6 +41,9 @@ func TestHistoryOperationsHonorPreCanceledContext(t *testing.T) {
 	if _, err := history.DeleteAll(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("delete all history: expected cancellation, got %v", err)
 	}
+	if _, err := history.PreviewDeleteAll(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("preview delete all history: expected cancellation, got %v", err)
+	}
 }
 
 func TestCoreHistoryOperationsWithoutRepositoryReturnInitializationError(t *testing.T) {
@@ -75,6 +78,13 @@ func TestCoreHistoryOperationsWithoutRepositoryReturnInitializationError(t *test
 			name: "delete all",
 			call: func() error {
 				_, err := core.DeleteAllHistoryReleases(context.Background())
+				return err
+			},
+		},
+		{
+			name: "preview delete all",
+			call: func() error {
+				_, err := core.PreviewDeleteAllHistoryReleases(context.Background())
 				return err
 			},
 		},

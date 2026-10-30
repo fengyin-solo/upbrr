@@ -1007,6 +1007,16 @@ func (c *Core) DeleteAllHistoryReleases(ctx context.Context) (int, error) {
 	return c.history.DeleteAll(ctx)
 }
 
+// PreviewDeleteAllHistoryReleases reports the read-only full-cleanup summary.
+// Unlike DeleteAllHistoryReleases it never closes active inputs, reserves the
+// deletion transaction or mutates files, workflow state or leases.
+func (c *Core) PreviewDeleteAllHistoryReleases(ctx context.Context) (api.HistoryDeleteAllPreview, error) {
+	if c.history == nil {
+		return api.HistoryDeleteAllPreview{}, errors.New("core: repository not initialized")
+	}
+	return c.history.PreviewDeleteAll(ctx)
+}
+
 // Close stops Core-owned background work and closes the repository only when
 // this Core opened and owns it.
 func (c *Core) Close() error {

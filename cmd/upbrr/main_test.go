@@ -242,6 +242,75 @@ func TestCLISeededConfigActivationMatchesServeAndLaterCLI(t *testing.T) {
 	}
 }
 
+func TestCLICleanupPreviewPrintsStableSummaryWithoutDeleting(t *testing.T) {
+	ctx := t.Context()
+	dbPath := filepath.Join(t.TempDir(), "state", "upbrr.db")
+	configPath := filepath.Join(t.TempDir(), "cleanup-preview.yaml")
+	configYAML := strings.Join([]string{
+		"main_settings:",
+		"  tmdb_api: \"e2e\"",
+		fmt.Sprintf("  db_path: %q", dbPath),
+		"logging:",
+		"  level: \"error\"",
+		"  file_enabled: false",
+		"torrent_clients: {}",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(configYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sourcePath := filepath.Join(t.TempDir(), "Example.Preview.2026.mkv")
+	repository, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if err := repository.Save(ctx, db.FileMetadata{Path: sourcePath, UpdatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("seed history source: %v", err)
+	}
+	if err := repository.Close(); err != nil {
+		t.Fatalf("close seed repository: %v", err)
+	}
+
+	for range 2 {
+		result := executeCLIForTest(ctx, t, []string{"--config", configPath, "--cleanup-preview"})
+		if result.code != 0 || result.err != nil {
+			t.Fatalf("cleanup-preview result: code=%d err=%v stderr=%q", result.code, result.err, result.stderr)
+		}
+		for _, want := range []string{
+			"stored release cleanup preview:",
+			"deletable sources: 1",
+			"child sources: 0",
+			"files to delete: 0",
+			"shared files kept: 0",
+			"private workflows to close: 0",
+			"skipped sources: 0",
+		} {
+			if !strings.Contains(result.stdout, want) {
+				t.Fatalf("cleanup-preview stdout %q missing %q", result.stdout, want)
+			}
+		}
+	}
+
+	verifyRepository, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyRepository.GetByPath(ctx, sourcePath); err != nil {
+		t.Fatalf("preview deleted stored source: %v", err)
+	}
+	if err := verifyRepository.Close(); err != nil {
+		t.Fatalf("close verify repository: %v", err)
+	}
+
+	rejected := executeCLIForTest(ctx, t, []string{"--config", configPath, "--cleanup-preview", "Example.mkv"})
+	if rejected.code != 2 || !strings.Contains(rejected.stderr, "--cleanup-preview does not accept input paths") {
+		t.Fatalf("cleanup-preview with path result: %#v", rejected)
+	}
+}
+
 func TestCLIConfigActivationReconcilesDurableUpgrade(t *testing.T) {
 	ctx := t.Context()
 	dbPath := filepath.Join(t.TempDir(), "activation.db")

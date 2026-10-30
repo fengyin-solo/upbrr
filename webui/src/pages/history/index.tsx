@@ -5,10 +5,22 @@ import { pageStyle } from "../../components/ui/pageStyle";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { historyClient } from "../../api/app";
-import type { HistoryEntry, HistoryOverview, HistoryRuleFailure } from "../../types";
+import type {
+  HistoryDeleteAllPreview,
+  HistoryEntry,
+  HistoryOverview,
+  HistoryRuleFailure,
+} from "../../types";
 import { cn } from "../../utils/cn";
 
 const emptyHistory: HistoryEntry[] = [];
+
+const deleteSkipReasonLabels: Record<string, string> = {
+  active_input: "Active input",
+  path_protected: "Path protected",
+};
+
+const deleteSkipReasonLabel = (reason: string) => deleteSkipReasonLabels[reason] ?? reason;
 
 const formatDate = (value: string) => {
   if (!value) {
@@ -82,6 +94,8 @@ export default function HistoryPage({ onReleaseDeleted, onOpenInput }: Props) {
   const [searchQuery, setSearchQuery] = useState("");
   const [deleting, setDeleting] = useState(false);
   const [opening, setOpening] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [deleteAllPreview, setDeleteAllPreview] = useState<HistoryDeleteAllPreview | null>(null);
   const [error, setError] = useState("");
   const [openFailure, setOpenFailure] = useState<{ sourcePath: string; message: string } | null>(
     null,
@@ -161,6 +175,19 @@ export default function HistoryPage({ onReleaseDeleted, onOpenInput }: Props) {
     }
   };
 
+  const handlePreviewDeleteAll = async () => {
+    setPreviewLoading(true);
+    setError("");
+    try {
+      setDeleteAllPreview(await historyClient.previewDeleteAll());
+    } catch (err) {
+      setDeleteAllPreview(null);
+      setError(String(err));
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
   const handleOpenInput = async () => {
     if (!selectedPath || !onOpenInput) return;
     setOpening(true);
@@ -197,6 +224,85 @@ export default function HistoryPage({ onReleaseDeleted, onOpenInput }: Props) {
           Review previously processed releases stored in SQLite and inspect full stored details.
         </p>
       </header>
+
+      {entries.length > 0 ? (
+        <div className="flex justify-end">
+          <button
+            type="button"
+            className="ghost"
+            disabled={previewLoading}
+            onClick={() => void handlePreviewDeleteAll()}
+          >
+            {previewLoading
+              ? "Preparing preview..."
+              : deleteAllPreview
+                ? "Refresh full cleanup preview"
+                : "Preview full cleanup"}
+          </button>
+        </div>
+      ) : null}
+
+      {deleteAllPreview ? (
+        <section
+          aria-label="Full cleanup preview"
+          className={`${pageStyle.panel} grid gap-3`}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h2 className="m-0">Full cleanup preview</h2>
+              <p className="helper m-0">Nothing is deleted while previewing.</p>
+            </div>
+            <button type="button" className="ghost" onClick={() => setDeleteAllPreview(null)}>
+              Dismiss
+            </button>
+          </div>
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-2 [&_h3]:mb-1 [&_h3]:mt-0 [&_h3]:text-sm">
+            <article className="rounded-lg border border-border bg-muted p-2.5 text-foreground">
+              <h3>Deletable sources</h3>
+              <p className="m-0 font-semibold">{deleteAllPreview.Sources}</p>
+            </article>
+            <article className="rounded-lg border border-border bg-muted p-2.5 text-foreground">
+              <h3>Child sources</h3>
+              <p className="m-0 font-semibold">{deleteAllPreview.ChildSources}</p>
+            </article>
+            <article className="rounded-lg border border-border bg-muted p-2.5 text-foreground">
+              <h3>Files to delete</h3>
+              <p className="m-0 font-semibold">{deleteAllPreview.Files}</p>
+            </article>
+            <article className="rounded-lg border border-border bg-muted p-2.5 text-foreground">
+              <h3>Shared files kept</h3>
+              <p className="m-0 font-semibold">{deleteAllPreview.SharedFilesKept}</p>
+            </article>
+            <article className="rounded-lg border border-border bg-muted p-2.5 text-foreground">
+              <h3>Private workflows to close</h3>
+              <p className="m-0 font-semibold">{deleteAllPreview.PrivateWorkflows}</p>
+            </article>
+            <article className="rounded-lg border border-border bg-muted p-2.5 text-foreground">
+              <h3>Skipped sources</h3>
+              <p className="m-0 font-semibold">{deleteAllPreview.SkippedSources.length}</p>
+            </article>
+          </div>
+          {deleteAllPreview.SkippedSources.length > 0 ? (
+            <article className="rounded-lg border border-border bg-muted p-2.5 text-foreground">
+              <h3 className="mb-2 mt-0 text-sm">Skipped source details</h3>
+              <ul className="m-0 grid gap-1 pl-4">
+                {deleteAllPreview.SkippedSources.map((skip, index) => (
+                  <li
+                    key={`${skip.SourcePath}-${index}`}
+                    className="[overflow-wrap:anywhere]"
+                  >
+                    <span className="font-mono">{skip.SourcePath}</span>
+                    {" — "}
+                    {deleteSkipReasonLabel(skip.Reason)}
+                  </li>
+                ))}
+              </ul>
+            </article>
+          ) : (
+            <p className="text-muted-foreground m-0">No sources would be skipped.</p>
+          )}
+        </section>
+      ) : null}
 
       <section
         className={`${pageStyle.panel} grid min-h-[560px] gap-3 lg:grid-cols-[minmax(260px,320px)_minmax(0,1fr)]`}

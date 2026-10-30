@@ -299,6 +299,34 @@ func (r *SQLiteRepository) ListStoredHistoryArtifactPaths(ctx context.Context) (
 	return paths, nil
 }
 
+// ListStoredHistoryArtifactReferences returns distinct stored
+// source-to-artifact references. Preview planning simulates sequential purge
+// retention from these pairs, so the read uses the exact artifact union as
+// ListStoredHistoryArtifactPaths and never mutates rows.
+func (r *SQLiteRepository) ListStoredHistoryArtifactReferences(ctx context.Context) ([]api.HistoryArtifactReference, error) {
+	rows, err := r.historyQuery(ctx).QueryContext(ctx, `
+		SELECT source_path, image_path FROM (`+historyArtifactPathsQuery+`)
+		WHERE TRIM(source_path) <> '' AND TRIM(image_path) <> ''`)
+	if err != nil {
+		return nil, fmt.Errorf("db list stored history artifact references: %w", err)
+	}
+	defer rows.Close()
+	references := make([]api.HistoryArtifactReference, 0)
+	for rows.Next() {
+		var reference api.HistoryArtifactReference
+		if err := rows.Scan(&reference.SourcePath, &reference.ImagePath); err != nil {
+			return nil, fmt.Errorf("db scan stored history artifact reference: %w", err)
+		}
+		reference.SourcePath = strings.TrimSpace(reference.SourcePath)
+		reference.ImagePath = strings.TrimSpace(reference.ImagePath)
+		references = append(references, reference)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db iterate stored history artifact references: %w", err)
+	}
+	return references, nil
+}
+
 // LoadHistoryCleanupSnapshot returns caller-owned local artifact paths and the
 // optional metadata needed to derive the managed release directory.
 func (r *SQLiteRepository) LoadHistoryCleanupSnapshot(ctx context.Context, sourcePath string) (api.HistoryCleanupSnapshot, error) {

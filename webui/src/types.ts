@@ -1363,6 +1363,23 @@ export type HistoryEntry = {
   RuleAdvisoryCount?: number;
 };
 
+export type HistoryDeleteSkipReason = "active_input" | "path_protected" | string;
+
+export type HistoryDeletePreviewSkip = {
+  SourcePath: string;
+  Reason: HistoryDeleteSkipReason;
+};
+
+/** Read-only summary returned before a full stored-history cleanup. */
+export type HistoryDeleteAllPreview = {
+  Sources: number;
+  ChildSources: number;
+  Files: number;
+  SharedFilesKept: number;
+  PrivateWorkflows: number;
+  SkippedSources: HistoryDeletePreviewSkip[];
+};
+
 export type HistoryUploadRecord = {
   Tracker: string;
   Status: string;

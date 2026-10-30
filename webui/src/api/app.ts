@@ -5,6 +5,7 @@ import type {
   ApplicationInfo,
   BrowseDirectoryRequest,
   BrowseDirectoryResponse,
+  HistoryDeleteAllPreview,
   HistoryEntry,
   HistoryOverview,
   ImageHostPolicyMetadata,
@@ -415,4 +416,6 @@ export const historyClient = {
     requestApp<HistoryOverview>("GetHistoryOverview", { SourcePath: sourcePath }, { signal }),
   removeRelease: (sourcePath: string) =>
     requestApp<void>("DeleteHistoryRelease", { SourcePath: sourcePath }),
+  previewDeleteAll: (signal?: AbortSignal) =>
+    requestApp<HistoryDeleteAllPreview>("PreviewDeleteAllHistory", undefined, { signal }),
 };
